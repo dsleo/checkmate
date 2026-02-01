@@ -55,11 +55,79 @@ body {
   justify-items: center;
 }
 
+.picker-wrap {
+  display: inline-flex;
+  align-items: center;
+  position: relative;
+}
+
+.split-main {
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+}
+
+.split-toggle {
+  height: 40px;
+  padding: 0 14px;
+  border: 1px solid var(--accent-dark);
+  border-left: none;
+  border-top-right-radius: 999px;
+  border-bottom-right-radius: 999px;
+  background: #ffead8;
+  cursor: pointer;
+  font-size: 14px;
+  color: var(--accent-dark);
+}
+
+.split-toggle.open {
+  background: #ffd7b7;
+}
+
+.picker-dropdown {
+  position: absolute;
+  top: 38px;
+  right: 0;
+  display: grid;
+  gap: 6px;
+  padding: 8px;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: #fffdf9;
+  box-shadow: 0 12px 30px rgba(28, 18, 10, 0.12);
+  z-index: 10;
+}
+
+.picker-dropdown button {
+  border: none;
+  background: transparent;
+  text-align: left;
+  padding: 6px 10px;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--ink);
+}
+
+.picker-dropdown button:hover {
+  background: #fff1e7;
+}
+
 .processing-panel {
   width: min(720px, 100%);
   margin-top: 6px;
   padding-top: 12px;
   border-top: 1px dashed var(--line);
+}
+
+.processing-line {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.processing-note {
+  font-size: 13px;
 }
 
 .processing-panel h3 {
@@ -392,6 +460,9 @@ button:hover {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 10px;
+  margin-bottom: 12px;
 }
 
 .panel-title {
@@ -475,6 +546,7 @@ button:hover {
   background: #fffdf9;
   font-size: 13px;
   cursor: pointer;
+  flex-wrap: wrap;
 }
 
 .summary-count.active {
@@ -491,6 +563,11 @@ button:hover {
 .summary-count.pending {
   border-color: #f1c67a;
   animation: pulse 1.2s ease-in-out infinite;
+}
+
+.summary-status {
+  font-size: 12px;
+  color: var(--muted);
 }
 
 @keyframes pulse {
@@ -822,13 +899,40 @@ button:hover {
   gap: 8px;
 }
 
+.summary-group > summary {
+  list-style: none;
+  cursor: pointer;
+}
+
+.summary-group > summary::-webkit-details-marker {
+  display: none;
+}
+
 .summary-group-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.08em;
   font-size: 11px;
   color: var(--accent-dark);
   margin: 6px 0 0;
+}
+
+.summary-group-title::after {
+  content: "▾";
+  font-size: 12px;
+  color: var(--muted);
+  transition: transform 0.2s ease;
+}
+
+.summary-group[open] .summary-group-title::after {
+  transform: rotate(0deg);
+}
+
+.summary-group:not([open]) .summary-group-title::after {
+  transform: rotate(-90deg);
 }
 
 .summary-severity-block {
@@ -881,6 +985,54 @@ button:hover {
   padding-left: 18px;
   margin: 10px 0 0;
   color: var(--muted);
+  display: grid;
+  gap: 6px;
+}
+
+.summary-inline-detail {
+  margin-top: 6px;
+  padding: 6px 8px;
+  border-radius: 10px;
+  background: #fff7ef;
+  border: 1px solid #e6d6c6;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.science-group {
+  display: grid;
+  gap: 8px;
+}
+
+.science-group > summary {
+  list-style: none;
+  cursor: pointer;
+}
+
+.science-group > summary::-webkit-details-marker {
+  display: none;
+}
+
+.science-status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  border-radius: 999px;
+  border: 1px solid #f1c67a;
+  background: #fff7e6;
+  color: #7a4b13;
+  font-size: 12px;
+  margin-bottom: 10px;
+  animation: pulse 1.2s ease-in-out infinite;
+}
+
+.science-status-pill .pill-label {
+  font-weight: 600;
+}
+
+.science-status-pill .pill-detail {
+  opacity: 0.85;
 }
 
 .summary-line {
@@ -888,20 +1040,22 @@ button:hover {
   align-items: center;
   gap: 10px;
   flex-wrap: wrap;
+  line-height: 1.4;
 }
 
 .summary-text {
   flex: 1 1 auto;
+  min-width: 240px;
 }
 
 .summary-fix {
   margin-left: auto;
-  border: 1px solid var(--accent-dark);
-  background: transparent;
+  border: 1px solid var(--line);
+  background: #fff5ec;
   color: var(--accent-dark);
   border-radius: 999px;
-  padding: 2px 8px;
-  font-size: 11px;
+  padding: 4px 10px;
+  font-size: 12px;
 }
 
 .summary-jump {

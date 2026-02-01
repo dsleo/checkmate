@@ -26,6 +26,16 @@ npm run dev:web
 - Server: http://localhost:8787
 - Web: http://localhost:5173
 
+## Tests
+
+```bash
+npm --prefix server install
+npm --prefix server test
+
+npm --prefix web install
+npm --prefix web test
+```
+
 ## Notes
 - Structural runs first, then Notation, Rhetoric, Critical in parallel.
 - Suggestions map to line-level JSON Patch replacements, with undo history.

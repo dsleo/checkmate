@@ -19,6 +19,13 @@ import {
   splitLines,
   getLineContext
 } from "./latex.js";
+import {
+  buildSectionChunks,
+  dedupeAcrossAgents,
+  dedupeIssues,
+  findBestLineByTokens,
+  summarizeMath
+} from "./review-utils.js";
 import { buildLinePatch } from "./diff.js";
 import {
   runStructural,
@@ -27,12 +34,14 @@ import {
   runCritical,
   runMathProof,
   runScience,
+  runResolveIssues,
   buildStructuralPrompt,
   buildNotationPrompt,
   buildRhetoricPrompt,
   buildCriticalPrompt,
   buildMathPrompt,
-  buildSciencePrompt
+  buildSciencePrompt,
+  buildResolvePrompt
 } from "./agents.js";
 
 dotenv.config();
@@ -52,35 +61,6 @@ function mapExcerptToLine(lines, excerpt) {
   if (!needle) return 1;
   const idx = lines.findIndex((line) => line.includes(needle));
   return idx >= 0 ? idx + 1 : 1;
-}
-
-function findBestLineByTokens(lines, excerpt) {
-  if (!excerpt) return 1;
-  const cleaned = excerpt
-    .toLowerCase()
-    .replace(/[^a-z0-9\s]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-  if (!cleaned) return 1;
-  const tokens = cleaned
-    .split(" ")
-    .filter((t) => t.length >= 4)
-    .slice(0, 10);
-  if (!tokens.length) return 1;
-  let bestScore = 0;
-  let bestLine = 1;
-  for (let i = 0; i < lines.length; i += 1) {
-    const windowText = lines.slice(i, i + 2).join(" ").toLowerCase();
-    let score = 0;
-    for (const token of tokens) {
-      if (windowText.includes(token)) score += 1;
-    }
-    if (score > bestScore) {
-      bestScore = score;
-      bestLine = i + 1;
-    }
-  }
-  return bestScore > 0 ? bestLine : 1;
 }
 
 function indexToLine(text, index) {
@@ -112,172 +92,49 @@ function getSectionBlockLines(sections, title, text) {
   return { startLine, endLine };
 }
 
-function buildRhetoricChunks(text, sections) {
-  if (!sections.length) {
-    return [{ text }];
-  }
-  const sorted = [...sections].sort((a, b) => a.index - b.index);
-  const chunks = [];
-  for (let i = 0; i < sorted.length; i += 1) {
-    const start = sorted[i].index;
-    const end = i + 1 < sorted.length ? sorted[i + 1].index : text.length;
-    const chunkText = text.slice(start, end).trim();
-    if (chunkText) {
-      chunks.push({
-        title: sorted[i].title,
-        text: chunkText
-      });
-    }
-  }
-  const maxChars = 30000;
-  const merged = [];
-  let buffer = "";
-  for (const chunk of chunks) {
-    if ((buffer + chunk.text).length > maxChars && buffer) {
-      merged.push({ text: buffer });
-      buffer = chunk.text;
-    } else {
-      buffer = buffer ? `${buffer}\n\n${chunk.text}` : chunk.text;
-    }
-  }
-  if (buffer) merged.push({ text: buffer });
-  if (merged.length <= 2) return merged;
-  const regrouped = [];
-  let acc = "";
-  for (const item of merged) {
-    if ((acc + item.text).length > maxChars * 2 && acc) {
-      regrouped.push({ text: acc });
-      acc = item.text;
-    } else {
-      acc = acc ? `${acc}\n\n${item.text}` : item.text;
-    }
-  }
-  if (acc) regrouped.push({ text: acc });
-  return regrouped;
+function formatChunkLabel(chunk) {
+  if (!chunk?.title) return "";
+  const level = chunk.level || "";
+  const label =
+    level === "section"
+      ? "Section"
+      : level === "subsection"
+        ? "Subsection"
+        : level === "subsubsection"
+          ? "Subsubsection"
+          : "Section";
+  return `${label}: ${chunk.title}`;
 }
 
-function buildSubsectionChunks(text) {
-  const sections = extractSections(text);
-  if (!sections.length) return [{ title: "", text }];
-  const subsectionStarts = sections.filter((s) =>
-    ["subsection", "subsubsection"].includes(s.level)
-  );
-  const boundaries = subsectionStarts.length ? subsectionStarts : sections;
-  const chunks = [];
-  for (let i = 0; i < boundaries.length; i += 1) {
-    const current = boundaries[i];
-    const next = boundaries.find((s) => s.index > current.index);
-    const end = next ? next.index : text.length;
-    const chunkText = text.slice(current.index, end).trim();
-    if (chunkText) {
-      chunks.push({ title: current.title, text: chunkText });
-    }
-  }
-  if (!chunks.length) return [{ title: "", text }];
-  const maxChars = 18000;
-  const merged = [];
-  let buffer = "";
-  let bufferTitle = "";
-  for (const chunk of chunks) {
-    if ((buffer + chunk.text).length > maxChars && buffer) {
-      merged.push({ title: bufferTitle, text: buffer });
-      buffer = chunk.text;
-      bufferTitle = chunk.title;
-    } else {
-      buffer = buffer ? `${buffer}\n\n${chunk.text}` : chunk.text;
-      bufferTitle = bufferTitle || chunk.title;
-    }
-  }
-  if (buffer) merged.push({ title: bufferTitle, text: buffer });
-  return merged;
-}
 
-function normalizeIssueText(text) {
-  return text
-    .toLowerCase()
-    .replace(/[^\w\s]/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function tokenSimilarity(a, b) {
-  const aTokens = new Set(a.split(" ").filter(Boolean));
-  const bTokens = new Set(b.split(" ").filter(Boolean));
-  if (!aTokens.size || !bTokens.size) return 0;
-  let overlap = 0;
-  for (const token of aTokens) {
-    if (bTokens.has(token)) overlap += 1;
-  }
-  return overlap / Math.max(aTokens.size, bTokens.size);
-}
-
-function dedupeByText(items, getText) {
-  const seen = [];
-  const result = [];
-  for (const item of items) {
-    const raw = getText(item);
-    const normalized = normalizeIssueText(raw);
-    if (!normalized) continue;
-    const isDuplicate = seen.some(
-      (prev) =>
-        prev === normalized ||
-        normalized.includes(prev) ||
-        prev.includes(normalized) ||
-        tokenSimilarity(prev, normalized) > 0.82
-    );
-    if (isDuplicate) continue;
-    seen.push(normalized);
-    result.push(item);
-  }
-  return result;
-}
-
-function dedupeAcrossAgents({ structural, notation, rhetoric, critical, science }) {
-  const seen = [];
-  const isDuplicate = (text) => {
-    const normalized = normalizeIssueText(text);
-    if (!normalized) return true;
-    const dup = seen.some(
-      (prev) =>
-        prev === normalized ||
-        normalized.includes(prev) ||
-        prev.includes(normalized) ||
-        tokenSimilarity(prev, normalized) > 0.82
-    );
-    if (!dup) seen.push(normalized);
-    return dup;
-  };
-
-  const structuralClean = dedupeByText(structural.integrity_report || [], (i) => i.message);
-  const notationClean = dedupeByText(
-    notation.symbol_analysis || [],
-    (i) => `${i.symbol} ${i.recommendation}`
-  );
-  const rhetoricClean = dedupeByText(rhetoric.logic_gaps || [], (i) => i.explanation);
-  const criticalClean = dedupeByText(critical.critique || [], (i) => i.weakness);
-  const scienceClean = dedupeByText(
-    science?.science_issues || [],
-    (i) => `${i.category} ${i.message}`
-  );
-
-  const structuralFiltered = structuralClean.filter((i) => !isDuplicate(i.message));
-  const notationFiltered = notationClean.filter(
-    (i) => !isDuplicate(`${i.symbol} ${i.recommendation}`)
-  );
-  const rhetoricFiltered = rhetoricClean.filter((i) => !isDuplicate(i.explanation));
-  const criticalFiltered = criticalClean.filter((i) => !isDuplicate(i.weakness));
-  const scienceFiltered = scienceClean.filter(
-    (i) => !isDuplicate(`${i.category} ${i.message}`)
-  );
-
-  return {
-    structural: { ...structural, integrity_report: structuralFiltered },
-    notation: { ...notation, symbol_analysis: notationFiltered },
-    rhetoric: { ...rhetoric, logic_gaps: rhetoricFiltered },
-    critical: { ...critical, critique: criticalFiltered },
-    science: science ? { ...science, science_issues: scienceFiltered } : science
-  };
-}
+const COMMON_ACRONYMS = new Set([
+  "AI",
+  "ML",
+  "NLP",
+  "CNN",
+  "RNN",
+  "LLM",
+  "API",
+  "HTTP",
+  "URL",
+  "CPU",
+  "GPU",
+  "SVM",
+  "PCA",
+  "NP",
+  "P",
+  "PSPACE",
+  "ROC",
+  "AUC",
+  "F1",
+  "TPU",
+  "SQL",
+  "JSON",
+  "PDF",
+  "RAM",
+  "CV",
+  "IR"
+]);
 
 function applyHeuristics({
   structural,
@@ -299,32 +156,7 @@ function applyHeuristics({
     RNN: "recurrent neural network",
     LLM: "large language model"
   };
-  const commonAcronyms = new Set([
-    "AI",
-    "ML",
-    "NLP",
-    "CNN",
-    "RNN",
-    "LLM",
-    "API",
-    "HTTP",
-    "URL",
-    "CPU",
-    "GPU",
-    "SVM",
-    "PCA",
-    "ROC",
-    "AUC",
-    "F1",
-    "TPU",
-    "SQL",
-    "JSON",
-    "PDF",
-    "RAM",
-    "NLP",
-    "CV",
-    "IR"
-  ]);
+  const commonAcronyms = COMMON_ACRONYMS;
   const textLines = text.split("\n");
   const resolvedPaperType = paperType || detectPaperType(text, sections);
 
@@ -482,7 +314,7 @@ function applyHeuristics({
         type: "unsupported_claim",
         excerpt: match[0],
         explanation: "Claim relies on rhetorical emphasis rather than evidence.",
-        improvement: "Provide evidence, citations, or empirical results to support the claim."
+        improvement: "Provide evidence or empirical results to support the claim."
       });
     }
   }
@@ -695,24 +527,6 @@ function getPaperExpectations(paperType) {
   return "Computer Science paper: clear problem framing, methodology, evaluation or analysis; discussion/conclusion often expected depending on venue. Ignore author/bibliography sections.";
 }
 
-function summarizeMath(results, total) {
-  const counts = { complete: 0, incomplete: 0, missing: 0, unclear: 0 };
-  for (const r of results) {
-    counts[r.verdict] = (counts[r.verdict] || 0) + 1;
-  }
-  return `Proof review: ${counts.complete} complete, ${counts.incomplete} incomplete, ${counts.missing} missing, ${counts.unclear} unclear (of ${total}).`;
-}
-
-function dedupeIssues(issues) {
-  const seen = new Set();
-  return issues.filter((issue) => {
-    const key = issue.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
-}
-
 
 function isActionableLineEdit(text) {
   if (!text) return false;
@@ -811,6 +625,7 @@ app.post("/api/review", async (req, res) => {
   emitLog("[review] request received");
 
   const latex = req.body?.latex || "";
+  const macroText = req.body?.macroText || "";
   emitLog(`[review] payload chars=${latex.length}`);
   const coreText = extractCoreText(latex);
   let maskedText = stripReferencesPreserveLines(stripPreamblePreserveLines(latex));
@@ -819,30 +634,78 @@ app.post("/api/review", async (req, res) => {
   maskedText = maskedText.replace(/\\cite\{[^}]*\}/gi, "");
   const lines = splitLines(maskedText);
   const preamble = extractPreamble(latex);
+  const combinedPreamble = macroText ? `${preamble}\n${macroText}` : preamble;
   const title = extractTitle(latex);
-  const macros = extractMacros(preamble);
+  const macros = extractMacros(combinedPreamble);
   const sections = extractSections(maskedText);
-  const sectionsCore = extractSections(coreText);
+  const sectionTitles = sections.map((s) => s.title);
   const minified = minifyLatex(coreText);
   const stripped = stripHeavyMath(coreText);
   const mathEnvs = extractMathEnvs(coreText);
-  const notationEnvs = [];
-  let notationBudget = 18000;
-  const maxEnvs = 120;
+  const normalizeMathEnv = (env) =>
+    env
+      .replace(/\\label\{[^}]*\}/gi, "")
+      .replace(/\\tag\{[^}]*\}/gi, "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .toLowerCase();
+  const seenMath = new Set();
+  const uniqueMathEnvs = [];
   for (const env of mathEnvs) {
-    if (notationBudget <= 0 || notationEnvs.length >= maxEnvs) break;
-    const slice = env.length > notationBudget ? env.slice(0, notationBudget) : env;
-    if (!slice.trim()) continue;
-    notationEnvs.push(slice);
-    notationBudget -= slice.length;
+    const normalized = normalizeMathEnv(env);
+    if (!normalized) continue;
+    if (seenMath.has(normalized)) continue;
+    seenMath.add(normalized);
+    uniqueMathEnvs.push(env);
   }
-  if (notationEnvs.length !== mathEnvs.length) {
+  const sectionChunks = buildSectionChunks(coreText);
+  const notationBatches = [];
+  const notationBatchLimit = 24000;
+  const notationBatchMax = 160;
+  let currentBatch = [];
+  let currentChars = 0;
+  for (const env of uniqueMathEnvs) {
+    if (!env.trim()) continue;
+    const nextChars = currentChars + env.length;
+    if (
+      currentBatch.length &&
+      (nextChars > notationBatchLimit || currentBatch.length >= notationBatchMax)
+    ) {
+      notationBatches.push(currentBatch);
+      currentBatch = [];
+      currentChars = 0;
+    }
+    currentBatch.push(env);
+    currentChars += env.length;
+  }
+  if (currentBatch.length) notationBatches.push(currentBatch);
+  if (notationBatches.length) {
     emitLog(
-      `[input] notation envs capped ${notationEnvs.length}/${mathEnvs.length} chars=${18000 - notationBudget}`
+      `[input] notation envs total=${mathEnvs.length} unique=${uniqueMathEnvs.length} batches=${notationBatches.length}`
     );
   }
   const definitions = extractDefinitionsSection(coreText);
   const { abstract, results, discussion } = extractAbstractResultsDiscussion(coreText);
+  const evidenceSummary = (() => {
+    const flags = [];
+    if (/\\begin\{(table|longtable|tabular)\}/i.test(coreText)) flags.push("tables present");
+    if (/\\begin\{figure\}/i.test(coreText) || /\\includegraphics\{/i.test(coreText))
+      flags.push("figures present");
+    if (/\b(experiments|evaluation|results|analysis|ablation|baseline)\b/i.test(coreText))
+      flags.push("experimental/analysis keywords present");
+    if (/\b(dataset|data)\b/i.test(coreText)) flags.push("dataset mentions present");
+    return flags.length ? flags.join("; ") : "No obvious evidence markers detected.";
+  })();
+  const sectionEvidence = sectionChunks.map((chunk) => {
+    const flags = [];
+    if (/\\begin\{(table|longtable|tabular)\}/i.test(chunk.text)) flags.push("tables");
+    if (/\\begin\{figure\}/i.test(chunk.text) || /\\includegraphics\{/i.test(chunk.text))
+      flags.push("figures");
+    if (/\b(experiments|evaluation|results|analysis|ablation|baseline)\b/i.test(chunk.text))
+      flags.push("experiment keywords");
+    if (/\b(dataset|data)\b/i.test(chunk.text)) flags.push("data keywords");
+    return { title: chunk.title || "Section", flags };
+  });
   const methodsSection = extractSectionContent(coreText, [
     "Methods",
     "Method",
@@ -857,6 +720,9 @@ app.post("/api/review", async (req, res) => {
   ]);
   const datasetsSection = extractSectionContent(coreText, ["Dataset", "Datasets", "Data"]);
   const paperType = detectPaperType(coreText, sections);
+  const hasEvidence =
+    /\\begin\{(table|figure|longtable|tabular)\}/i.test(coreText) ||
+    /\\includegraphics\{/i.test(coreText);
   const expectations = getPaperExpectations(paperType);
   const artifacts = paperType === "math" ? extractMathArtifacts(coreText) : [];
   const wordCount = coreText.split(/\s+/).filter(Boolean).length;
@@ -976,32 +842,34 @@ app.post("/api/review", async (req, res) => {
     expectations
   });
   promptCapture.Notation = buildNotationPrompt({
-    mathEnvs: notationEnvs,
+    mathEnvs: notationBatches[0] || [],
     definitions,
-    preamble,
+    preamble: combinedPreamble,
     paperType,
     expectations
   });
-  promptCapture.Critical = buildCriticalPrompt({
-    abstract,
-    results,
-    discussion,
-    fullText: coreText,
-    paperType,
-    expectations
-  });
-  if (paperType === "ml") {
-    promptCapture.Science = buildSciencePrompt({
+    promptCapture.Critical = buildCriticalPrompt({
       abstract,
-      methods: methodsSection,
-      experiments: experimentsSection,
-      datasets: datasetsSection,
       results,
+      discussion,
       fullText: coreText,
       paperType,
-      expectations
+      expectations,
+      evidenceSummary
     });
-  }
+    if (paperType === "ml") {
+      promptCapture.Science = buildSciencePrompt({
+        abstract,
+        methods: methodsSection,
+        experiments: experimentsSection,
+        datasets: datasetsSection,
+        results,
+        fullText: coreText,
+        paperType,
+        expectations,
+        evidenceSummary
+      });
+    }
   promptCapture.Math =
     paperType === "math"
       ? buildMathPrompt({
@@ -1012,10 +880,17 @@ app.post("/api/review", async (req, res) => {
         })
       : null;
 
+  const AGENT_TIMEOUT_MS = Number.parseInt(
+    process.env.AGENT_TIMEOUT_MS || "120000",
+    10
+  );
+
+  const partialErrors = {};
   const agents = [
     {
       name: "Structural",
       progress: 25,
+      timeoutMs: AGENT_TIMEOUT_MS,
       run: () =>
         runStructural({
           preamble: minified,
@@ -1029,21 +904,111 @@ app.post("/api/review", async (req, res) => {
     {
       name: "Notation",
       progress: 50,
-      run: () =>
-        runNotation({
-          mathEnvs: notationEnvs,
-          definitions,
-          preamble,
-          paperType,
-          expectations,
-          logger: emitLog
-        })
+      run: async () => {
+        if (!notationBatches.length) {
+          return runNotation({
+            mathEnvs: [],
+            definitions,
+            preamble: combinedPreamble,
+            paperType,
+            expectations,
+            logger: emitLog
+          });
+        }
+        if (notationBatches.length === 1) {
+          return runNotation({
+            mathEnvs: notationBatches[0],
+            definitions,
+            preamble: combinedPreamble,
+            paperType,
+            expectations,
+            logger: emitLog
+          });
+        }
+        promptCapture.Notation = [];
+        const merged = [];
+        const batches = notationBatches.map((batch, idx) => ({
+          batch,
+          idx
+        }));
+        const concurrency = 3;
+        let inFlight = 0;
+        let cursor = 0;
+        const runNext = async () => {
+          if (cursor >= batches.length) return;
+          const { batch, idx } = batches[cursor];
+          cursor += 1;
+          inFlight += 1;
+          sendEvent(res, "agent-update", {
+            agent: "Notation",
+            status: "processing",
+            progress: 45 + Math.round(((idx + 1) / notationBatches.length) * 5),
+            detail: {
+              phase: "batch-start",
+              message: `Math batch ${idx + 1}/${notationBatches.length}`
+            },
+            payload: { symbol_analysis: merged }
+          });
+          promptCapture.Notation[idx] = buildNotationPrompt({
+            mathEnvs: batch,
+            definitions,
+            preamble: combinedPreamble,
+            paperType,
+            expectations
+          });
+          let output;
+          try {
+            const batchTimeoutMs = Math.min(
+              240000,
+              AGENT_TIMEOUT_MS + Math.round(batch.length * 600)
+            );
+            output = await withTimeout(
+              runNotation({
+                mathEnvs: batch,
+                definitions,
+                preamble: combinedPreamble,
+                paperType,
+                expectations,
+                logger: emitLog
+              }),
+              `Notation batch ${idx + 1}/${notationBatches.length}`,
+              batchTimeoutMs
+            );
+            merged.push(...(output.symbol_analysis || []));
+          } catch (err) {
+            partialErrors.Notation = err?.message || "Notation batch failed.";
+            emitLog(`[agent] Notation partial: ${partialErrors.Notation}`, {
+              level: "error"
+            });
+          }
+          sendEvent(res, "agent-update", {
+            agent: "Notation",
+            status: "processing",
+            progress: 45 + Math.round(((idx + 1) / notationBatches.length) * 5),
+            detail: {
+              phase: "batch-complete",
+              message: `Math batch ${idx + 1}/${notationBatches.length} done`
+            },
+            payload: { symbol_analysis: merged }
+          });
+          inFlight -= 1;
+          if (cursor < batches.length) {
+            await runNext();
+          }
+        };
+        const starters = [];
+        while (inFlight < concurrency && cursor < batches.length) {
+          starters.push(runNext());
+        }
+        await Promise.all(starters);
+        return { symbol_analysis: merged };
+      }
     },
     {
       name: "Rhetoric",
       progress: 75,
       run: async () => {
-        const shouldChunk = coreText.length > 18000 || wordCount > 2800;
+        const shouldChunk = coreText.length > 42000 || wordCount > 7000;
         if (!shouldChunk) {
           promptCapture.Rhetoric = [
             buildRhetoricPrompt({ text: coreText, paperType, expectations })
@@ -1056,13 +1021,16 @@ app.post("/api/review", async (req, res) => {
           });
         }
 
-        const chunks = buildSubsectionChunks(coreText);
-        emitLog(`[agent] Rhetoric chunked parts=${chunks.length}`);
+        const chunks = sectionChunks;
+        emitLog(
+          `[agent] Rhetoric sections=${sectionChunks.length} headings=${sections.length} chunks=${chunks.length}`
+        );
         const merged = [];
         const prior = [];
         promptCapture.Rhetoric = [];
         for (let i = 0; i < chunks.length; i += 1) {
           const chunk = chunks[i];
+          const label = formatChunkLabel(chunk);
           sendEvent(res, "agent-update", {
             agent: "Rhetoric",
             status: "processing",
@@ -1072,7 +1040,7 @@ app.post("/api/review", async (req, res) => {
               chunkIndex: i + 1,
               chunkTotal: chunks.length,
               sectionTitle: chunk.title || "",
-              message: `Chunk ${i + 1}/${chunks.length}${chunk.title ? ` • ${chunk.title}` : ""}`
+              message: label || "Processing section"
             },
             payload: { logic_gaps: merged }
           });
@@ -1085,15 +1053,34 @@ app.post("/api/review", async (req, res) => {
               chunkTitle: chunk.title
             })
           );
-          emitLog(`[agent] Rhetoric chunk ${i + 1}/${chunks.length}`);
-          const output = await runRhetoric({
-            text: chunk.text,
-            paperType,
-            expectations,
-            priorIssues: prior.slice(-5),
-            chunkTitle: chunk.title,
-            logger: emitLog
-          });
+          emitLog(
+            `[agent] Rhetoric ${i + 1}/${chunks.length}${label ? ` • ${label}` : ""}`
+          );
+          let output;
+          try {
+            const chunkTimeoutMs = Math.min(
+              240000,
+              AGENT_TIMEOUT_MS + Math.ceil(chunk.text.length / 8000) * 15000
+            );
+            output = await withTimeout(
+              runRhetoric({
+                text: chunk.text,
+                paperType,
+                expectations,
+                priorIssues: prior.slice(-5),
+                chunkTitle: chunk.title,
+                logger: emitLog
+              }),
+              `Rhetoric chunk ${i + 1}/${chunks.length}`,
+              chunkTimeoutMs
+            );
+          } catch (err) {
+            partialErrors.Rhetoric = err?.message || "Rhetoric chunk failed.";
+            emitLog(`[agent] Rhetoric partial: ${partialErrors.Rhetoric}`, {
+              level: "error"
+            });
+            break;
+          }
           merged.push(...(output.logic_gaps || []));
           output.logic_gaps?.forEach((issue) => {
             if (issue.explanation) prior.push(issue.explanation.slice(0, 160));
@@ -1107,7 +1094,7 @@ app.post("/api/review", async (req, res) => {
               chunkIndex: i + 1,
               chunkTotal: chunks.length,
               sectionTitle: chunk.title || "",
-              message: `Chunk ${i + 1}/${chunks.length} done${chunk.title ? ` • ${chunk.title}` : ""}`
+              message: label ? `${label} done` : "Section done"
             },
             payload: { logic_gaps: merged }
           });
@@ -1121,7 +1108,7 @@ app.post("/api/review", async (req, res) => {
             name: "Science",
             progress: 85,
             run: async () => {
-              const shouldChunk = coreText.length > 18000 || wordCount > 2800;
+              const shouldChunk = coreText.length > 42000 || wordCount > 7000;
               if (!shouldChunk) {
                 promptCapture.Science = buildSciencePrompt({
                   abstract,
@@ -1146,13 +1133,17 @@ app.post("/api/review", async (req, res) => {
                 });
               }
 
-              const chunks = buildSubsectionChunks(coreText);
-              emitLog(`[agent] Science chunked parts=${chunks.length}`);
+              const chunks = sectionChunks;
+              emitLog(
+                `[agent] Science sections=${sectionChunks.length} headings=${sections.length} chunks=${chunks.length}`
+              );
               const merged = [];
+              const staged = [];
               const prior = [];
               promptCapture.Science = [];
               for (let i = 0; i < chunks.length; i += 1) {
                 const chunk = chunks[i];
+                const label = formatChunkLabel(chunk);
                 sendEvent(res, "agent-update", {
                   agent: "Science",
                   status: "processing",
@@ -1162,7 +1153,7 @@ app.post("/api/review", async (req, res) => {
                     chunkIndex: i + 1,
                     chunkTotal: chunks.length,
                     sectionTitle: chunk.title || "",
-                    message: `Chunk ${i + 1}/${chunks.length}${chunk.title ? ` • ${chunk.title}` : ""}`
+                    message: label || "Processing section"
                   },
                   payload: { science_issues: merged }
                 });
@@ -1173,28 +1164,62 @@ app.post("/api/review", async (req, res) => {
                     experiments: experimentsSection,
                     datasets: datasetsSection,
                     results,
-                    fullText: chunk.text,
-                    paperType,
-                    expectations,
-                    priorIssues: prior.slice(-5),
-                    chunkTitle: chunk.title
-                  })
-                );
-                emitLog(`[agent] Science chunk ${i + 1}/${chunks.length}`);
-                const output = await runScience({
-                  abstract,
-                  methods: methodsSection,
-                  experiments: experimentsSection,
-                  datasets: datasetsSection,
-                  results,
                   fullText: chunk.text,
                   paperType,
                   expectations,
                   priorIssues: prior.slice(-5),
                   chunkTitle: chunk.title,
-                  logger: emitLog
+                  evidenceSummary
+                })
+              );
+                emitLog(
+                  `[agent] Science ${i + 1}/${chunks.length}${label ? ` • ${label}` : ""}`
+                );
+                let output;
+                try {
+                  const chunkTimeoutMs = Math.min(
+                    240000,
+                    AGENT_TIMEOUT_MS + Math.ceil(chunk.text.length / 8000) * 15000
+                  );
+                  output = await withTimeout(
+                    runScience({
+                      abstract,
+                      methods: methodsSection,
+                      experiments: experimentsSection,
+                      datasets: datasetsSection,
+                      results,
+                    fullText: chunk.text,
+                    paperType,
+                    expectations,
+                    priorIssues: prior.slice(-5),
+                    chunkTitle: chunk.title,
+                    evidenceSummary,
+                    logger: emitLog
+                  }),
+                    `Science chunk ${i + 1}/${chunks.length}`,
+                    chunkTimeoutMs
+                  );
+                } catch (err) {
+                  partialErrors.Science = err?.message || "Science chunk failed.";
+                  emitLog(`[agent] Science partial: ${partialErrors.Science}`, {
+                    level: "error"
+                  });
+                  break;
+                }
+                const safeCategories = new Set(["metrics", "baselines", "reproducibility"]);
+                const safeIssues = (output.science_issues || []).filter((issue) =>
+                  safeCategories.has(issue.category)
+                );
+                merged.push(...safeIssues);
+                (output.science_issues || []).forEach((issue, idx) => {
+                  staged.push({
+                    id: `science-${i}-${idx}`,
+                    sectionIndex: i,
+                    text: issue.message,
+                    excerpt: issue.excerpt,
+                    issue
+                  });
                 });
-                merged.push(...(output.science_issues || []));
                 output.science_issues?.forEach((issue) => {
                   if (issue.message) prior.push(issue.message.slice(0, 160));
                 });
@@ -1207,10 +1232,48 @@ app.post("/api/review", async (req, res) => {
                     chunkIndex: i + 1,
                     chunkTotal: chunks.length,
                     sectionTitle: chunk.title || "",
-                    message: `Chunk ${i + 1}/${chunks.length} done${chunk.title ? ` • ${chunk.title}` : ""}`
+                    message: label ? `${label} done` : "Section done"
                   },
                   payload: { science_issues: merged }
                 });
+              }
+              if (chunks.length > 1 && staged.length) {
+                promptCapture.ScienceResolution = buildResolvePrompt({
+                  issues: staged,
+                  sectionTitles,
+                  paperType,
+                  expectations,
+                  agent: "Science",
+                  evidenceSummary,
+                  sectionEvidence
+                });
+                try {
+                  const resolution = await withTimeout(
+                    runResolveIssues({
+                    issues: staged,
+                    sectionTitles,
+                    paperType,
+                    expectations,
+                    agent: "Science",
+                    evidenceSummary,
+                    sectionEvidence,
+                    logger: emitLog
+                  }),
+                    "Science resolve"
+                  );
+                  const keep = new Set(resolution.keep_ids || []);
+                  const filtered = staged
+                    .filter((item) => keep.has(item.id))
+                    .map((item) => item.issue);
+                  return { science_issues: filtered };
+                } catch (err) {
+                  partialErrors.Science =
+                    err?.message || "Science resolve failed.";
+                  emitLog(`[agent] Science resolve failed: ${partialErrors.Science}`, {
+                    level: "error"
+                  });
+                  return { science_issues: merged };
+                }
               }
               return { science_issues: merged };
             }
@@ -1221,7 +1284,7 @@ app.post("/api/review", async (req, res) => {
       name: "Critical",
       progress: 95,
       run: async () => {
-        const shouldChunk = coreText.length > 18000 || wordCount > 2800;
+        const shouldChunk = coreText.length > 42000 || wordCount > 7000;
         if (!shouldChunk) {
           return runCritical({
             abstract,
@@ -1234,13 +1297,17 @@ app.post("/api/review", async (req, res) => {
           });
         }
 
-        const chunks = buildSubsectionChunks(coreText);
-        emitLog(`[agent] Critical chunked parts=${chunks.length}`);
+        const chunks = sectionChunks;
+        emitLog(
+          `[agent] Critical sections=${sectionChunks.length} headings=${sections.length} chunks=${chunks.length}`
+        );
         const merged = [];
+        const staged = [];
         const prior = [];
         promptCapture.Critical = [];
         for (let i = 0; i < chunks.length; i += 1) {
           const chunk = chunks[i];
+          const label = formatChunkLabel(chunk);
           sendEvent(res, "agent-update", {
             agent: "Critical",
             status: "processing",
@@ -1250,7 +1317,7 @@ app.post("/api/review", async (req, res) => {
               chunkIndex: i + 1,
               chunkTotal: chunks.length,
               sectionTitle: chunk.title || "",
-              message: `Chunk ${i + 1}/${chunks.length}${chunk.title ? ` • ${chunk.title}` : ""}`
+              message: label || "Processing section"
             },
             payload: { critique: merged }
           });
@@ -1266,19 +1333,56 @@ app.post("/api/review", async (req, res) => {
               chunkTitle: chunk.title
             })
           );
-          emitLog(`[agent] Critical chunk ${i + 1}/${chunks.length}`);
-          const output = await runCritical({
-            abstract,
-            results,
-            discussion,
+          emitLog(
+            `[agent] Critical ${i + 1}/${chunks.length}${label ? ` • ${label}` : ""}`
+          );
+          let output;
+          try {
+            const chunkTimeoutMs = Math.min(
+              240000,
+              AGENT_TIMEOUT_MS + Math.ceil(chunk.text.length / 8000) * 15000
+            );
+            output = await withTimeout(
+              runCritical({
+                abstract,
+                results,
+                discussion,
             fullText: chunk.text,
             paperType,
             expectations,
             priorIssues: prior.slice(-5),
             chunkTitle: chunk.title,
+            evidenceSummary,
             logger: emitLog
+            }),
+              `Critical chunk ${i + 1}/${chunks.length}`,
+              chunkTimeoutMs
+            );
+          } catch (err) {
+            partialErrors.Critical = err?.message || "Critical chunk failed.";
+            emitLog(`[agent] Critical partial: ${partialErrors.Critical}`, {
+              level: "error"
+            });
+            break;
+          }
+          const safeIssues = (output.critique || []).filter((issue) => {
+            const text = `${issue.weakness || ""} ${issue.excerpt || ""}`.toLowerCase();
+            const risky =
+              /missing|not provided|absent|lacks|no results|no discussion|no experiments|no evaluation|no dataset|no data|no table|no figure|insufficient evidence|unsupported/i.test(
+                text
+              );
+            return !risky;
           });
-          merged.push(...(output.critique || []));
+          merged.push(...safeIssues);
+          (output.critique || []).forEach((issue, idx) => {
+            staged.push({
+              id: `critical-${i}-${idx}`,
+              sectionIndex: i,
+              text: issue.weakness,
+              excerpt: issue.excerpt,
+              issue
+            });
+          });
           output.critique?.forEach((issue) => {
             if (issue.weakness) prior.push(issue.weakness.slice(0, 160));
           });
@@ -1291,10 +1395,48 @@ app.post("/api/review", async (req, res) => {
               chunkIndex: i + 1,
               chunkTotal: chunks.length,
               sectionTitle: chunk.title || "",
-              message: `Chunk ${i + 1}/${chunks.length} done${chunk.title ? ` • ${chunk.title}` : ""}`
+              message: label ? `${label} done` : "Section done"
             },
             payload: { critique: merged }
           });
+        }
+        if (chunks.length > 1 && staged.length) {
+          promptCapture.CriticalResolution = buildResolvePrompt({
+            issues: staged,
+            sectionTitles,
+            paperType,
+            expectations,
+            agent: "Reviewer #2",
+            evidenceSummary,
+            sectionEvidence
+          });
+          try {
+            const resolution = await withTimeout(
+              runResolveIssues({
+              issues: staged,
+              sectionTitles,
+              paperType,
+              expectations,
+              agent: "Reviewer #2",
+              evidenceSummary,
+              sectionEvidence,
+              logger: emitLog
+            }),
+              "Critical resolve"
+            );
+            const keep = new Set(resolution.keep_ids || []);
+            const filtered = staged
+              .filter((item) => keep.has(item.id))
+              .map((item) => item.issue);
+            return { critique: filtered };
+          } catch (err) {
+            partialErrors.Critical =
+              err?.message || "Critical resolve failed.";
+            emitLog(`[agent] Critical resolve failed: ${partialErrors.Critical}`, {
+              level: "error"
+            });
+            return { critique: merged };
+          }
         }
         return { critique: merged };
       }
@@ -1311,18 +1453,14 @@ app.post("/api/review", async (req, res) => {
   }
 
   const resultsMap = {};
-  const AGENT_TIMEOUT_MS = Number.parseInt(
-    process.env.AGENT_TIMEOUT_MS || "90000",
-    10
-  );
 
-  const withTimeout = (promise, label) =>
+  const withTimeout = (promise, label, timeoutMs = AGENT_TIMEOUT_MS) =>
     new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
-        const err = new Error(`${label} timed out after ${AGENT_TIMEOUT_MS}ms`);
+        const err = new Error(`${label} timed out after ${timeoutMs}ms`);
         emitLog(`[agent] ${err.message}`, { level: "error" });
         reject(err);
-      }, AGENT_TIMEOUT_MS);
+      }, timeoutMs);
       promise
         .then((value) => {
           clearTimeout(timer);
@@ -1343,11 +1481,15 @@ app.post("/api/review", async (req, res) => {
   };
   const agentPromises = agents.map(async (agent) => {
     try {
+      const initialMessage =
+        agent.name === "Structural" || agent.name === "Notation"
+          ? "Analyzing full paper"
+          : "Preparing sections";
       sendEvent(res, "agent-update", {
         agent: agent.name,
         status: "processing",
         progress: 8,
-        detail: { phase: "llm-call", message: "Calling model" }
+        detail: { phase: "llm-call", message: initialMessage }
       });
       emitLog(
         `[agent] ${agent.name} input chars=${
@@ -1357,11 +1499,13 @@ app.post("/api/review", async (req, res) => {
               ? mathEnvs.join("\n").length
               : agent.name === "Rhetoric"
                 ? coreText.length
-                : abstract.length + results.length + discussion.length
+                : coreText.length
         }`
       );
       const startAt = Date.now();
-      const output = await withTimeout(agent.run(), agent.name);
+      const output = agent.timeoutMs
+        ? await withTimeout(agent.run(), agent.name, agent.timeoutMs)
+        : await agent.run();
       const elapsed = Date.now() - startAt;
       emitLog(`[agent] ${agent.name} completed in ${elapsed}ms`);
       resultsMap[agent.name] = output;
@@ -1397,6 +1541,12 @@ app.post("/api/review", async (req, res) => {
   const critical = resultsMap.Critical;
   const science = resultsMap.Science;
 
+  if (paperType !== "math" && notation?.symbol_analysis?.length) {
+    notation.symbol_analysis = notation.symbol_analysis.filter(
+      (item) => !COMMON_ACRONYMS.has(item.symbol)
+    );
+  }
+
   const attachLine = (item, fallback) => {
     if (item.location?.line && item.location.line > 1) return item;
     const excerpt = item.excerpt || fallback || "";
@@ -1413,12 +1563,22 @@ app.post("/api/review", async (req, res) => {
       attachLine(item, item.excerpt || item.explanation)
     )
   };
-  const criticalWithLines = {
+  let criticalWithLines = {
     ...critical,
     critique: (critical.critique || []).map((item) =>
       attachLine(item, item.excerpt || item.weakness)
     )
   };
+  if (hasEvidence) {
+    const missingResultsRe =
+      /missing.*(results|discussion|experiments|evaluation|dataset|data|tables?|figures?)|results.*discussion.*missing/i;
+    criticalWithLines = {
+      ...criticalWithLines,
+      critique: criticalWithLines.critique.filter(
+        (item) => !missingResultsRe.test(item.weakness || "")
+      )
+    };
+  }
   const scienceWithLines = science
     ? {
         ...science,

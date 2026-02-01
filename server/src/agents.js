@@ -92,6 +92,10 @@ const SCIENCE_SCHEMA = z.object({
     .default([])
 });
 
+const RESOLVE_SCHEMA = z.object({
+  keep_ids: z.array(z.string()).default([])
+});
+
 const RESPONSE_SCHEMAS = {
   Structural: {
     type: "object",
@@ -258,6 +262,14 @@ const RESPONSE_SCHEMAS = {
     },
     required: ["science_issues"]
   },
+  ResolveIssues: {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      keep_ids: { type: "array", items: { type: "string" } }
+    },
+    required: ["keep_ids"]
+  },
   Math: {
     type: "object",
     additionalProperties: false,
@@ -274,7 +286,7 @@ const RESPONSE_SCHEMAS = {
 function getClient() {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) return null;
-  const timeoutMs = Number.parseInt(process.env.OPENAI_TIMEOUT_MS || "90000", 10);
+  const timeoutMs = Number.parseInt(process.env.OPENAI_TIMEOUT_MS || "600000", 10);
   return new OpenAI({ apiKey, timeout: timeoutMs });
 }
 
@@ -329,8 +341,8 @@ async function callOpenAI(client, messages, schemaName, logger) {
   if (schemaName) assertStructuredModel(model);
   const totalChars = messages.reduce((n, m) => n + (m.content?.length || 0), 0);
   const requestLine = `[openai] request model=${model} msgs=${messages.length} chars=${totalChars}`;
-  console.log(requestLine);
-  logger?.(requestLine);
+  if (logger) logger(requestLine);
+  else console.log(requestLine);
   const completion = await client.chat.completions.create({
     model,
     messages,
@@ -346,8 +358,8 @@ async function callOpenAI(client, messages, schemaName, logger) {
       : { type: "json_object" },
     ...(model.startsWith("gpt-5") ? {} : { temperature: 0.2 })
   });
-  console.log("[openai] response received");
-  logger?.("[openai] response received");
+  if (logger) logger("[openai] response received");
+  else console.log("[openai] response received");
   return completion.choices[0]?.message?.content || "{}";
 }
 
@@ -494,7 +506,7 @@ export function buildNotationPrompt({
   expectations
 }) {
   const system = "You are the Notation & Formalism Agent. Output ONLY JSON.";
-  const user = `Paper type: ${paperType}\nExpectations: ${expectations}\n\nPreamble:\n${preamble}\n\nDefinitions/Notation section:\n${definitions}\n\nMath environments (sampled for size):\n${mathEnvs.join("\n\n---\n\n")}\n\nFind undefined symbols, casing inconsistencies, and conflicts. Do not flag common field acronyms (e.g., ML, NLP, AI, GPU) unless in a math paper or if truly ambiguous.`;
+  const user = `Paper type: ${paperType}\nExpectations: ${expectations}\n\nPreamble (including macro.tex if provided):\n${preamble}\n\nDefinitions/Notation section:\n${definitions}\n\nMath environments (sampled for size):\n${mathEnvs.join("\n\n---\n\n")}\n\nFind undefined symbols, casing inconsistencies, and conflicts. Do not flag common field acronyms (e.g., ML, NLP, AI, GPU, NP) unless in a math paper or if truly ambiguous.`;
   return { system, user };
 }
 
@@ -528,7 +540,7 @@ export function buildRhetoricPrompt({ text, paperType, expectations, priorIssues
     ? `\n\nPrior issues (avoid duplicates, maintain consistency):\n- ${priorIssues.join("\n- ")}`
     : "";
   const title = chunkTitle ? `\n\nSection focus: ${chunkTitle}` : "";
-  const user = `Paper type: ${paperType}\nExpectations: ${expectations}${title}\n\nText (sliding window approx):\n${text}${prior}\n\nIdentify unsupported claims, clarity issues, or logical fallacies. Provide improvement. Return a short excerpt and a line number. If no issues are found, return an empty list.`;
+  const user = `Paper type: ${paperType}\nExpectations: ${expectations}${title}\n\nText:\n${text}${prior}\n\nIdentify unsupported claims, clarity issues, or logical fallacies. Provide an improvement. Return a short excerpt copied verbatim from the text and a line number. If no issues are found, return an empty list.`;
   return { system, user };
 }
 
@@ -564,14 +576,16 @@ export function buildCriticalPrompt({
   paperType,
   expectations,
   priorIssues,
-  chunkTitle
+  chunkTitle,
+  evidenceSummary
 }) {
   const system = `You are Reviewer #2 — a highly skeptical, senior academic reviewer for a top-tier journal.\nYou are pedantic, rigorous, and unimpressed by grand claims.\nYour goal is to find every reason to reject this paper. Do not offer praise. Do not be polite.\nIdentify hand-wavy logic, insufficient data, over-generalized conclusions, and methodological flaws.\nEvidence Gap: If the author says "it is clear", demand proof.\nNovelty Check: If the author claims a "novel" approach, question if it is merely a trivial variation.\nThe "So What?" Factor: Question the significance of the results.\nAtheistic Stance: Do not assume the authors are right. Assume they are biased toward their own hypothesis.\nOutput ONLY JSON.`;
   const prior = priorIssues?.length
     ? `\n\nPrior issues (avoid duplicates, maintain consistency):\n- ${priorIssues.join("\n- ")}`
     : "";
   const title = chunkTitle ? `\n\nSection focus: ${chunkTitle}` : "";
-  const user = `Paper type: ${paperType}\nExpectations: ${expectations}${title}\n\nAbstract:\n${abstract}\n\nResults:\n${results}\n\nDiscussion:\n${discussion}\n\nFull paper (core text):\n${fullText}${prior}\n\nReturn critique items with weakness, rebuttal_potential, severity, a short excerpt, and a line number.`;
+  const evidence = evidenceSummary ? `\n\nGlobal evidence summary:\n${evidenceSummary}` : "";
+  const user = `Paper type: ${paperType}\nExpectations: ${expectations}${title}\n\nAbstract:\n${abstract}\n\nResults:\n${results}\n\nDiscussion:\n${discussion}\n\nFull paper (core text):\n${fullText}${prior}${evidence}\n\nImportant: Do NOT assume missing Results/Discussion just because those section titles are absent. If tables/figures/analysis appear elsewhere, do not flag "missing results/discussion".\nReturn critique items with weakness, rebuttal_potential, severity, a short excerpt copied verbatim from the text, and a line number.`;
   return { system, user };
 }
 
@@ -610,7 +624,8 @@ export {
   NOTATION_SCHEMA,
   RHETORIC_SCHEMA,
   CRITICAL_SCHEMA,
-  SCIENCE_SCHEMA
+  SCIENCE_SCHEMA,
+  RESOLVE_SCHEMA
 };
 
 export function buildMathPrompt({ artifact, context, paperType, expectations }) {
@@ -658,7 +673,8 @@ export function buildSciencePrompt({
   paperType,
   expectations,
   priorIssues,
-  chunkTitle
+  chunkTitle,
+  evidenceSummary
 }) {
   const system =
     "You are the Experimental Science Agent for Machine Learning papers. Focus on empirical rigor, experimental design, and evidence. Output ONLY JSON.";
@@ -666,8 +682,60 @@ export function buildSciencePrompt({
     ? `\n\nPrior issues (avoid duplicates, maintain consistency):\n- ${priorIssues.join("\n- ")}`
     : "";
   const title = chunkTitle ? `\n\nSection focus: ${chunkTitle}` : "";
-  const user = `Paper type: ${paperType}\nExpectations: ${expectations}${title}\n\nAbstract:\n${abstract}\n\nMethods:\n${methods}\n\nExperiments/Evaluation:\n${experiments}\n\nDatasets:\n${datasets}\n\nResults:\n${results}\n\nFull paper (core text):\n${fullText}${prior}\n\nIdentify issues in experimental design, data, baselines, metrics, ablations, reproducibility, analysis, and claims-vs-evidence. For each issue, include: category, severity, message, evidence (quote/summary), recommendation, excerpt (short snippet), and a line number.`;
+  const evidence = evidenceSummary ? `\n\nGlobal evidence summary:\n${evidenceSummary}` : "";
+  const user = `Paper type: ${paperType}\nExpectations: ${expectations}${title}\n\nAbstract:\n${abstract}\n\nMethods:\n${methods}\n\nExperiments/Evaluation:\n${experiments}\n\nDatasets:\n${datasets}\n\nResults:\n${results}\n\nFull paper (core text):\n${fullText}${prior}${evidence}\n\nIdentify issues in experimental design, data, baselines, metrics, ablations, reproducibility, analysis, and claims-vs-evidence. For each issue, include: category, severity, message, evidence (quote/summary), recommendation, excerpt copied verbatim from the text, and a line number.`;
   return { system, user };
+}
+
+export function buildResolvePrompt({
+  issues,
+  sectionTitles,
+  paperType,
+  expectations,
+  agent,
+  evidenceSummary,
+  sectionEvidence
+}) {
+  const system = `You are a critical editor reconciling ${agent} findings across the full paper.\nDecide which issues remain valid after later sections are considered.\nOutput ONLY JSON.`;
+  const evidence = evidenceSummary ? `\n\nGlobal evidence summary:\n${evidenceSummary}` : "";
+  const sectionSignals = sectionEvidence?.length
+    ? `\n\nSection evidence flags:\n${sectionEvidence
+        .map((s, i) => `${i + 1}. ${s.title} — ${s.flags.join(", ") || "none"}`)
+        .join("\n")}`
+    : "";
+  const user = `Paper type: ${paperType}\nExpectations: ${expectations}\n\nSection titles (in order):\n${sectionTitles
+    .map((t, i) => `${i + 1}. ${t}`)
+    .join("\n")}${evidence}${sectionSignals}\n\nIssues (id | section | text | excerpt):\n${issues
+    .map(
+      (i) =>
+        `${i.id} | ${i.sectionIndex + 1} | ${i.text}${i.excerpt ? ` | ${i.excerpt}` : ""}`
+    )
+    .join("\n")}\n\nKeep only issues that are still valid after considering later sections. If a later section likely addresses or resolves an issue, drop it. Return keep_ids.`;
+  return { system, user };
+}
+
+export async function runResolveIssues({
+  issues,
+  sectionTitles,
+  paperType,
+  expectations,
+  agent,
+  logger
+}) {
+  const { system, user } = buildResolvePrompt({
+    issues,
+    sectionTitles,
+    paperType,
+    expectations,
+    agent
+  });
+  return runJsonChat({
+    system,
+    user,
+    schema: RESOLVE_SCHEMA,
+    schemaName: "ResolveIssues",
+    logger
+  });
 }
 
 export async function runScience({
