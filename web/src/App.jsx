@@ -103,6 +103,138 @@ function renderMathInline(text, macros) {
   return html;
 }
 
+function findLineFromExcerpt(text, excerpt) {
+  if (!excerpt) return 1;
+  const needle = excerpt.trim();
+  if (!needle) return 1;
+  const idx = text.indexOf(needle);
+  if (idx === -1) return 1;
+  return text.slice(0, idx).split("\n").length;
+}
+
+function stripLatexInline(text) {
+  if (!text) return "";
+  return text
+    .replace(/\\[a-zA-Z]+\*?(?:\[[^\]]*])?(?:\{[^}]*\})?/g, " ")
+    .replace(/\\\[[\s\S]*?\\\]/g, " ")
+    .replace(/\$[^$]*\$/g, " ")
+    .replace(/[{}]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+function tokenize(text) {
+  return stripLatexInline(text)
+    .split(" ")
+    .filter((t) => t.length >= 3);
+}
+
+function findBestLineByTokens(text, target) {
+  const targetTokens = tokenize(target);
+  if (!targetTokens.length) return 1;
+  const targetSet = new Set(targetTokens);
+
+  const lines = text.split("\n");
+  let bestScore = 0;
+  let bestLine = 1;
+  const window = 4;
+  for (let i = 0; i < lines.length; i += 1) {
+    const windowText = lines.slice(i, i + window).join(" ");
+    const windowTokens = tokenize(windowText);
+    if (!windowTokens.length) continue;
+    const windowSet = new Set(windowTokens);
+    let overlap = 0;
+    for (const token of targetSet) {
+      if (windowSet.has(token)) overlap += 1;
+    }
+    const jaccard =
+      overlap / Math.max(1, targetSet.size + windowSet.size - overlap);
+    const score = overlap * 0.7 + jaccard * 0.3;
+    if (score > bestScore) {
+      bestScore = score;
+      bestLine = i + 1;
+    }
+  }
+  return bestScore > 0 ? bestLine : 1;
+}
+
+function resolveJumpLine(text, primaryLine, fallbackText) {
+  if (primaryLine && primaryLine > 1) return primaryLine;
+  const fromExact = findLineFromExcerpt(text, fallbackText);
+  if (fromExact > 1) return fromExact;
+  return findBestLineByTokens(text, fallbackText);
+}
+
+function findSentenceRange(text, anchorIndex, hintText) {
+  const safeIndex = Math.max(0, Math.min(text.length - 1, anchorIndex));
+  const left = Math.max(
+    0,
+    Math.max(
+      text.lastIndexOf(". ", safeIndex),
+      text.lastIndexOf("? ", safeIndex),
+      text.lastIndexOf("! ", safeIndex),
+      text.lastIndexOf("\n\n", safeIndex)
+    )
+  );
+  const rightCandidates = [
+    text.indexOf(". ", safeIndex),
+    text.indexOf("? ", safeIndex),
+    text.indexOf("! ", safeIndex),
+    text.indexOf("\n\n", safeIndex)
+  ].filter((idx) => idx !== -1);
+  const right = rightCandidates.length ? Math.min(...rightCandidates) : text.length;
+  let start = left === 0 ? 0 : left + 1;
+  let end = Math.min(text.length, right + 1);
+
+  if (hintText) {
+    const paragraphStart = text.lastIndexOf("\n\n", safeIndex);
+    const paragraphEnd = text.indexOf("\n\n", safeIndex);
+    const pStart = paragraphStart === -1 ? 0 : paragraphStart + 2;
+    const pEnd = paragraphEnd === -1 ? text.length : paragraphEnd;
+    const paragraph = text.slice(pStart, pEnd);
+    const sentences = paragraph
+      .split(/(?<=[.!?])\s+/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (sentences.length) {
+      let best = sentences[0];
+      let bestScore = 0;
+      for (const sentence of sentences) {
+        const score = tokenize(sentence).filter((t) =>
+          tokenize(hintText).includes(t)
+        ).length;
+        if (score > bestScore) {
+          bestScore = score;
+          best = sentence;
+        }
+      }
+      const sentenceIndex = paragraph.indexOf(best);
+      if (sentenceIndex !== -1) {
+        start = pStart + sentenceIndex;
+        end = start + best.length;
+      }
+    }
+  }
+  return { start, end };
+}
+
+function jumpToLine(textAreaRef, text, line, hintText) {
+  const lines = text.split("\n");
+  const safeLine = Math.max(1, Math.min(lines.length, line || 1));
+  const lineStartIndex = lines.slice(0, safeLine - 1).join("\n").length;
+  const range = findSentenceRange(text, lineStartIndex, hintText);
+
+  if (textAreaRef.current) {
+    textAreaRef.current.focus();
+    textAreaRef.current.setSelectionRange(range.start, range.end);
+    textAreaRef.current.scrollIntoView({
+      behavior: "smooth",
+      block: "center"
+    });
+  }
+}
+
 function HomePage({
   latex,
   fileError,
@@ -135,7 +267,11 @@ function HomePage({
       onFinal: () => {}
     });
   };
-  const completedAgents = ["Structural", "Notation", "Rhetoric", "Critical"].filter(
+  const agentList =
+    preflight?.paperType === "ml"
+      ? ["Structural", "Notation", "Rhetoric", "Science", "Critical"]
+      : ["Structural", "Notation", "Rhetoric", "Critical"];
+  const completedAgents = agentList.filter(
     (name) => status[name]?.status === "completed"
   ).length;
 
@@ -197,27 +333,35 @@ function HomePage({
         {(isReviewing || hasStarted) && (
           <div className="processing-panel">
             <h3>Processing</h3>
-            <p className="muted">{completedAgents}/4 agents completed</p>
+            <p className="muted">
+              {completedAgents}/{agentList.length} agents completed
+            </p>
             {math?.status === "processing" && (
               <span className="status-pill success">Math agent running</span>
             )}
-            {preflight && (
+            {preflight?.paperType && (
               <p className="muted">
-                Detected {preflight.paperType.toUpperCase()} · {preflight.sections} sections ·{" "}
-                {preflight.wordCount} words
+                {preflight.paperType === "ml"
+                  ? "This looks like a Machine Learning paper."
+                  : preflight.paperType === "math"
+                    ? "This looks like a Mathematics paper."
+                    : "This looks like a Computer Science paper."}
               </p>
             )}
             <div className="progress">
               <div className="progress-bar" style={{ width: `${progress}%` }} />
             </div>
             <div className="status-list">
-              {["Structural", "Notation", "Rhetoric", "Critical"].map((name) => (
+              {agentList.map((name) => (
                 <div key={name} className="status-item">
                   <span>{name}</span>
                   <span>
                     {status[name]?.status === "processing" ? (
                       <span className="status-processing">
-                        processing <span className="dots">...</span>
+                        {status[name]?.detail?.message
+                          ? status[name].detail.message
+                          : "processing"}{" "}
+                        <span className="dots">...</span>
                       </span>
                     ) : status[name]?.status === "completed" ? (
                       "done"
@@ -227,7 +371,7 @@ function HomePage({
                   </span>
                 </div>
               ))}
-              {math?.status && math.status !== "skipped" && (
+              {preflight?.paperType === "math" && math?.status && math.status !== "skipped" && (
                 <div className="status-item">
                   <span>Proof Review</span>
                   <span>
@@ -275,12 +419,14 @@ function ReviewPage({
   isReviewing,
   math,
   macros,
+  prompts,
   reviewCompleteAt,
   suggestions,
   structural,
   notation,
   rhetoric,
   critical,
+  science,
   summaryItems,
   activeSuggestion,
   activeSummaryFixId,
@@ -301,6 +447,63 @@ function ReviewPage({
   const [expandedRebuttals, setExpandedRebuttals] = useState(new Set());
   const proofCarouselRef = useRef(null);
   const [showToast, setShowToast] = useState(false);
+  const agentList =
+    results?.payload?.science || status.Science
+      ? ["Structural", "Notation", "Rhetoric", "Science", "Critical"]
+      : ["Structural", "Notation", "Rhetoric", "Critical"];
+  const completedCount = agentList.filter(
+    (name) => status[name]?.status === "completed"
+  ).length;
+
+  const renderPromptBlock = (label, prompt) => {
+    if (!prompt) return null;
+    if (Array.isArray(prompt)) {
+      if (!prompt.length) return null;
+      const combined = prompt
+        .map((chunk, idx) => `# Chunk ${idx + 1}\n${chunk.system}\n\n${chunk.user}`)
+        .join("\n\n---\n\n");
+      return (
+        <details className="prompt-block">
+          <summary>{label} ({prompt.length} chunks)</summary>
+          <div className="prompt-actions">
+            <button
+              className="prompt-copy"
+              type="button"
+              onClick={() => navigator.clipboard.writeText(combined)}
+            >
+              Copy prompt
+            </button>
+          </div>
+          <div className="prompt-chunks">
+            {prompt.map((chunk, idx) => (
+              <details key={`${label}-${idx}`} className="prompt-sub">
+                <summary>Chunk {idx + 1}</summary>
+                <pre>{chunk.system}</pre>
+                <pre>{chunk.user}</pre>
+              </details>
+            ))}
+          </div>
+        </details>
+      );
+    }
+    const combined = `${prompt.system}\n\n${prompt.user}`;
+    return (
+      <details className="prompt-block">
+        <summary>{label}</summary>
+        <div className="prompt-actions">
+          <button
+            className="prompt-copy"
+            type="button"
+            onClick={() => navigator.clipboard.writeText(combined)}
+          >
+            Copy prompt
+          </button>
+        </div>
+        <pre>{prompt.system}</pre>
+        <pre>{prompt.user}</pre>
+      </details>
+    );
+  };
 
   useEffect(() => {
     if (!reviewCompleteAt) return;
@@ -348,13 +551,16 @@ function ReviewPage({
               <div className="progress-bar" style={{ width: `${progress}%` }} />
             </div>
             <div className="status-list">
-              {["Structural", "Notation", "Rhetoric", "Critical"].map((name) => (
+              {agentList.map((name) => (
                 <div key={name} className="status-item">
                   <span>{name}</span>
                   <span>
                     {status[name]?.status === "processing" ? (
                       <span className="status-processing">
-                        processing <span className="dots">...</span>
+                        {status[name]?.detail?.message
+                          ? status[name].detail.message
+                          : "processing"}{" "}
+                        <span className="dots">...</span>
                       </span>
                     ) : (
                       status[name]?.status || "idle"
@@ -362,7 +568,8 @@ function ReviewPage({
                   </span>
                 </div>
               ))}
-              {math?.status && math.status !== "skipped" && (
+              {results?.payload?.math?.status &&
+                results.payload.math.status !== "skipped" && (
                 <div className="status-item">
                   <span>Proof Review</span>
                   <span>
@@ -404,18 +611,10 @@ function ReviewPage({
           <p className="eyebrow">Review Results</p>
           <h1>Actionable feedback, prioritized for revisions.</h1>
           <p className="lead">
-            Review summary, inline diffs, and a Reviewer #2 stress test — all in one
-            place.
+            Review summary, inline diffs, experimental rigor checks, and a Reviewer #2
+            stress test — all in one place.
           </p>
-          <p className="muted">
-            {isReviewing
-              ? `Partial results loaded. ${Object.values(status).filter((s) => s?.status === "completed").length}/4 agents completed${
-                  math?.status === "processing"
-                    ? ` • Proof review ${math.completed || 0}/${math.total || 0}`
-                    : ""
-                }.`
-              : "Review complete."}
-          </p>
+          {!isReviewing && <p className="muted">Review complete.</p>}
         </div>
         <div className="hero-actions">
           <button className="ghost" onClick={() => navigate("/")}>Go Back</button>
@@ -425,7 +624,7 @@ function ReviewPage({
       {showToast && <div className="toast">Review complete ✓</div>}
 
       <section className="panel">
-        <h2>Feedback Summary</h2>
+        <h2>First-pass Review</h2>
         <div className="summary-counts">
           {["All", "Structural", "Notation", "Rhetoric", "Reviewer #2"]
             .filter((name) => {
@@ -449,6 +648,13 @@ function ReviewPage({
                   key={name}
                   className={`summary-count ${agentFilter === name ? "active" : ""} ${
                     done && adjusted === 0 && name !== "All" ? "complete" : ""
+                  } ${
+                    name !== "All" &&
+                    (name === "Reviewer #2"
+                      ? status.Critical?.status === "processing"
+                      : status[name]?.status === "processing")
+                      ? "pending"
+                      : ""
                   }`}
                   onClick={() => setAgentFilter(name)}
                   type="button"
@@ -499,24 +705,12 @@ function ReviewPage({
                                 <button
                                   className="summary-jump"
                                   onClick={() => {
-                                    const lines = latex.split("\\n");
-                                    const start = Math.max(0, (item.line || 1) - 2);
-                                    const end = Math.min(lines.length, start + 4);
-                                    const startIndex = lines.slice(0, start).join("\\n").length;
-                                    const endIndex =
-                                      lines.slice(0, end).join("\\n").length +
-                                      (end < lines.length ? 1 : 0);
-                                    if (textAreaRef.current) {
-                                      textAreaRef.current.focus();
-                                      textAreaRef.current.setSelectionRange(
-                                        startIndex,
-                                        endIndex
-                                      );
-                                      textAreaRef.current.scrollIntoView({
-                                        behavior: "smooth",
-                                        block: "center"
-                                      });
-                                    }
+                                    const targetLine = resolveJumpLine(
+                                      latex,
+                                      item.line,
+                                      item.excerpt || item.text
+                                    );
+                                    jumpToLine(textAreaRef, latex, targetLine, item.excerpt || item.text);
                                   }}
                                   title="Jump to text"
                                   aria-label="Jump to text"
@@ -601,7 +795,54 @@ function ReviewPage({
         )}
       </section>
 
-      {math.status !== "idle" && (
+      {results?.payload?.science?.science_issues && (
+        <section className="panel">
+          <h2>Science Review</h2>
+          <p className="muted">Empirical rigor checks for machine learning papers.</p>
+          {science.length === 0 ? (
+            <p className="muted">No issues detected.</p>
+          ) : (
+            <div className="science-list">
+              {science.map((item, idx) => (
+                <div key={`science-${idx}`} className={`science-card ${item.severity}`}>
+                  <span className="summary-severity-corner">
+                    {item.severity.toUpperCase()}
+                  </span>
+                  <div className="science-header">
+                    <span className="tag">{item.category.replace(/_/g, " ")}</span>
+                    {item.excerpt && (
+                      <button
+                        className="summary-jump"
+                        onClick={() =>
+                          jumpToLine(
+                            textAreaRef,
+                            latex,
+                            resolveJumpLine(latex, 0, item.excerpt),
+                            item.excerpt || item.message
+                          )
+                        }
+                        title="Jump to text"
+                        aria-label="Jump to text"
+                      >
+                        🔍
+                      </button>
+                    )}
+                  </div>
+                  <p className="science-message">{item.message}</p>
+                  {item.evidence && <p className="science-detail">{item.evidence}</p>}
+                  {item.recommendation && (
+                    <p className="science-detail">
+                      <span>Recommendation:</span> {item.recommendation}
+                    </p>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </section>
+      )}
+
+      {math?.status && math.status !== "skipped" && math.status !== "idle" && (
         <section className="panel">
           <h2>Proof Review</h2>
           <p className="muted">
@@ -708,7 +949,7 @@ function ReviewPage({
         <div className="panel">
           <div className="panel-header">
             <div className="panel-title">
-              <h2>{results?.payload?.title || selectedFile || "LaTeX Source"}</h2>
+              <h2>Review of {results?.payload?.title || selectedFile || "Untitled Paper"}</h2>
               <div className="panel-actions">
                 <button className="ghost icon-button" onClick={undoLast} aria-label="Undo">
                   ↶
@@ -744,7 +985,25 @@ function ReviewPage({
         </div>
       </section>
 
+      {prompts && Object.keys(prompts).length > 0 && (
+        <section className="panel">
+          <details className="settings-block">
+            <summary>Settings</summary>
+            <p className="muted">Prompts used for this review.</p>
+            <div className="prompt-list">
+              {renderPromptBlock("Structural", prompts.Structural)}
+              {renderPromptBlock("Notation", prompts.Notation)}
+              {renderPromptBlock("Rhetoric", prompts.Rhetoric)}
+              {renderPromptBlock("Science", prompts.Science)}
+              {renderPromptBlock("Reviewer #2", prompts.Critical)}
+              {renderPromptBlock("Math (per artifact template)", prompts.Math)}
+            </div>
+          </details>
+        </section>
+      )}
+
       {status.Critical?.status === "completed" && null}
+
     </div>
   );
 }
@@ -772,6 +1031,8 @@ export default function App() {
   const [logs, setLogs] = useState([]);
   const controllerRef = useRef(null);
   const reviewModeRef = useRef("full");
+  const firstChunkRef = useRef({});
+  const activeAgentsRef = useRef([]);
 
   const suggestions = (results?.payload?.suggestions || []).filter(
     (item) => !acceptedIds.has(item.id)
@@ -784,8 +1045,10 @@ export default function App() {
   const notation = results?.payload?.notation?.symbol_analysis || [];
   const rhetoric = results?.payload?.rhetoric?.logic_gaps || [];
   const critical = results?.payload?.critical?.critique || [];
+  const science = results?.payload?.science?.science_issues || [];
   const math = results?.payload?.math || { status: "idle", summary: "", results: [] };
   const macros = results?.payload?.macros || {};
+  const prompts = results?.payload?.prompts || {};
 
   const summaryItems = useMemo(() => {
     const items = [];
@@ -810,7 +1073,8 @@ export default function App() {
         severity: item.type === "unsupported_claim" ? "high" : "low",
         text: item.explanation,
         agent: "Rhetoric",
-        line: 1
+        line: item.location?.line || 1,
+        excerpt: item.excerpt
       });
     }
     for (const item of critical) {
@@ -818,7 +1082,8 @@ export default function App() {
         severity: item.severity,
         text: item.weakness,
         agent: "Reviewer #2",
-        line: 1,
+        line: item.location?.line || 1,
+        excerpt: item.excerpt,
         rebuttal: item.rebuttal_potential
       });
     }
@@ -878,7 +1143,7 @@ export default function App() {
     const sortGroup = (arr) => arr.sort((a, b) => order[a.severity] - order[b.severity]);
     Object.values(grouped).forEach(sortGroup);
     return grouped;
-  }, [structural, notation, rhetoric, critical]);
+  }, [structural, notation, rhetoric, critical, science]);
 
   const issueCounts = useMemo(() => {
     return {
@@ -917,6 +1182,8 @@ export default function App() {
       });
       setResolvedReports(new Set());
     }
+    firstChunkRef.current = {};
+    activeAgentsRef.current = [];
     setLogs([]);
     setActiveSuggestion(null);
     setIsReviewing(true);
@@ -943,23 +1210,35 @@ export default function App() {
           for (const evt of parseSSEChunk(chunk)) {
             if (evt.event === "preflight") {
               setPreflight(evt.data);
+              activeAgentsRef.current =
+                evt.data.paperType === "ml"
+                  ? ["Structural", "Notation", "Rhetoric", "Science", "Critical"]
+                  : ["Structural", "Notation", "Rhetoric", "Critical"];
+              if (evt.data.paperType === "ml") {
+                setStatus((prev) => ({
+                  ...prev,
+                  Science: { status: "processing" }
+                }));
+              }
               if (!results) {
                 setResults((prev) =>
                   prev || {
-                    status: "processing",
-                    progress: 0,
-                    payload: {
-                      title: evt.data.title || "",
-                      macros: {},
-                      structural: { integrity_report: [] },
-                      notation: { symbol_analysis: [] },
-                      rhetoric: { logic_gaps: [] },
-                      critical: { critique: [] },
-                      math: { status: "idle", summary: "", results: [] },
-                      suggestions: [],
-                      patches: []
+                      status: "processing",
+                      progress: 0,
+                      payload: {
+                        title: evt.data.title || "",
+                        macros: {},
+                        structural: { integrity_report: [] },
+                        notation: { symbol_analysis: [] },
+                        rhetoric: { logic_gaps: [] },
+                        science: { science_issues: [] },
+                        critical: { critique: [] },
+                        math: { status: "idle", summary: "", results: [] },
+                        prompts: {},
+                        suggestions: [],
+                        patches: []
+                      }
                     }
-                  }
                 );
               }
             }
@@ -986,6 +1265,21 @@ export default function App() {
                   [evt.data.agent]: evt.data
                 }));
               }
+              if (
+                evt.data.status === "completed" ||
+                evt.data.detail?.phase === "chunk-complete"
+              ) {
+                firstChunkRef.current[evt.data.agent] = true;
+                const list = activeAgentsRef.current;
+                if (
+                  onFirst &&
+                  list.length > 0 &&
+                  list.every((name) => firstChunkRef.current[name])
+                ) {
+                  onFirst();
+                  onFirst = null;
+                }
+              }
               if (evt.data.payload) {
                 setResults((prev) => {
                   const base =
@@ -998,8 +1292,10 @@ export default function App() {
                         structural: { integrity_report: [] },
                         notation: { symbol_analysis: [] },
                         rhetoric: { logic_gaps: [] },
+                        science: { science_issues: [] },
                         critical: { critique: [] },
                         math: { status: "idle", summary: "", results: [] },
+                        prompts: {},
                         suggestions: [],
                         patches: []
                       }
@@ -1011,6 +1307,8 @@ export default function App() {
                         ? "notation"
                         : evt.data.agent === "Rhetoric"
                           ? "rhetoric"
+                          : evt.data.agent === "Science"
+                            ? "science"
                           : evt.data.agent === "Critical"
                             ? "critical"
                             : null;
@@ -1023,10 +1321,6 @@ export default function App() {
                     }
                   };
                 });
-              }
-              if (evt.data.status === "completed" && onFirst) {
-                onFirst();
-                onFirst = null;
               }
             }
             if (evt.event === "final") {
@@ -1297,11 +1591,13 @@ export default function App() {
               reviewCompleteAt={reviewCompleteAt}
               math={math}
               macros={macros}
+              prompts={prompts}
               suggestions={suggestions}
               structural={structural}
               notation={notation}
               rhetoric={rhetoric}
               critical={critical}
+              science={science}
               summaryItems={summaryItems}
               activeSuggestion={activeSuggestion}
               activeSummaryFixId={activeSummaryFixId}

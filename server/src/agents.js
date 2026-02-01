@@ -40,7 +40,10 @@ const RHETORIC_SCHEMA = z.object({
         type: z.enum(["unsupported_claim", "clarity", "logical_fallacy"]),
         excerpt: z.string(),
         explanation: z.string(),
-        improvement: z.string()
+        improvement: z.string(),
+        location: z.object({
+          line: z.number()
+        })
       })
     )
     .default([])
@@ -52,11 +55,221 @@ const CRITICAL_SCHEMA = z.object({
       z.object({
         weakness: z.string(),
         rebuttal_potential: z.string(),
-        severity: z.enum(["high", "medium"])
+        severity: z.enum(["high", "medium"]),
+        excerpt: z.string(),
+        location: z.object({
+          line: z.number()
+        })
       })
     )
     .default([])
 });
+
+const SCIENCE_SCHEMA = z.object({
+  science_issues: z
+    .array(
+      z.object({
+        category: z.enum([
+          "experimental_design",
+          "data",
+          "baselines",
+          "metrics",
+          "ablation",
+          "reproducibility",
+          "analysis",
+          "claims_vs_evidence"
+        ]),
+        severity: z.enum(["high", "medium", "low"]),
+        message: z.string(),
+        evidence: z.string(),
+        recommendation: z.string(),
+        excerpt: z.string(),
+        location: z.object({
+          line: z.number()
+        })
+      })
+    )
+    .default([])
+});
+
+const RESPONSE_SCHEMAS = {
+  Structural: {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      integrity_report: {
+        type: "array",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            scope: {
+              type: "string",
+              enum: ["cross-reference", "bibliography", "structure"]
+            },
+            location: {
+              type: "object",
+              additionalProperties: false,
+              properties: {
+                line: { type: "number" },
+                context: { type: "string" }
+              },
+              required: ["line", "context"]
+            },
+            severity: { type: "string", enum: ["error", "warning"] },
+            message: { type: "string" },
+            fix_suggestion: { type: "string" }
+          },
+          required: ["scope", "location", "severity", "message", "fix_suggestion"]
+        }
+      }
+    },
+    required: ["integrity_report"]
+  },
+  Notation: {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      symbol_analysis: {
+        type: "array",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            symbol: { type: "string" },
+            status: {
+              type: "string",
+              enum: ["undefined_at_first_use", "inconsistent_casing", "conflict"]
+            },
+            location: {
+              type: "object",
+              additionalProperties: false,
+              properties: { line: { type: "number" } },
+              required: ["line"]
+            },
+            recommendation: { type: "string" }
+          },
+          required: ["symbol", "status", "location", "recommendation"]
+        }
+      }
+    },
+    required: ["symbol_analysis"]
+  },
+  Rhetoric: {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      logic_gaps: {
+        type: "array",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            type: { type: "string", enum: ["unsupported_claim", "clarity", "logical_fallacy"] },
+            excerpt: { type: "string" },
+            explanation: { type: "string" },
+            improvement: { type: "string" },
+            location: {
+              type: "object",
+              additionalProperties: false,
+              properties: { line: { type: "number" } },
+              required: ["line"]
+            }
+          },
+          required: ["type", "excerpt", "explanation", "improvement", "location"]
+        }
+      }
+    },
+    required: ["logic_gaps"]
+  },
+  Critical: {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      critique: {
+        type: "array",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            weakness: { type: "string" },
+            rebuttal_potential: { type: "string" },
+            severity: { type: "string", enum: ["high", "medium"] },
+            excerpt: { type: "string" },
+            location: {
+              type: "object",
+              additionalProperties: false,
+              properties: { line: { type: "number" } },
+              required: ["line"]
+            }
+          },
+          required: ["weakness", "rebuttal_potential", "severity", "excerpt", "location"]
+        }
+      }
+    },
+    required: ["critique"]
+  },
+  Science: {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      science_issues: {
+        type: "array",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            category: {
+              type: "string",
+              enum: [
+                "experimental_design",
+                "data",
+                "baselines",
+                "metrics",
+                "ablation",
+                "reproducibility",
+                "analysis",
+                "claims_vs_evidence"
+              ]
+            },
+            severity: { type: "string", enum: ["high", "medium", "low"] },
+            message: { type: "string" },
+            evidence: { type: "string" },
+            recommendation: { type: "string" },
+            excerpt: { type: "string" },
+            location: {
+              type: "object",
+              additionalProperties: false,
+              properties: { line: { type: "number" } },
+              required: ["line"]
+            }
+          },
+          required: [
+            "category",
+            "severity",
+            "message",
+            "evidence",
+            "recommendation",
+            "excerpt",
+            "location"
+          ]
+        }
+      }
+    },
+    required: ["science_issues"]
+  },
+  Math: {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      artifact_type: { type: "string" },
+      verdict: { type: "string", enum: ["complete", "incomplete", "missing", "unclear"] },
+      issues: { type: "array", items: { type: "string" } },
+      recommendation: { type: "string" }
+    },
+    required: ["artifact_type", "verdict", "issues", "recommendation"]
+  }
+};
 
 function getClient() {
   const apiKey = process.env.OPENAI_API_KEY;
@@ -65,7 +278,21 @@ function getClient() {
   return new OpenAI({ apiKey, timeout: timeoutMs });
 }
 
-async function runJsonChat({ system, user, schema, logger }) {
+function assertStructuredModel(model) {
+  const supported = new Set([
+    "gpt-4o-2024-08-06",
+    "gpt-4o-mini-2024-07-18",
+    "gpt-5-mini",
+    "gpt-5-mini-2025-08-07"
+  ]);
+  if (!supported.has(model)) {
+    throw new Error(
+      `Structured Outputs require a supported model (e.g., gpt-5-mini). Current: ${model}`
+    );
+  }
+}
+
+async function runJsonChat({ system, user, schema, schemaName, logger }) {
   const client = getClient();
   if (!client || process.env.MOCK_MODE === "1") {
     return mockResponse(schema);
@@ -77,10 +304,10 @@ async function runJsonChat({ system, user, schema, logger }) {
   ];
 
   try {
-  const content = await callOpenAI(client, messages, logger);
-  const parsed = safeParseJson(content);
-  return schema.parse(parsed);
-} catch (err) {
+    const content = await callOpenAI(client, messages, schemaName, logger);
+    const parsed = safeParseJson(content);
+    return schema.parse(parsed);
+  } catch (err) {
     // Retry once with a stricter instruction if the first response was invalid.
     const retryMessages = [
       { role: "system", content: system },
@@ -91,33 +318,59 @@ async function runJsonChat({ system, user, schema, logger }) {
           "\n\nYour previous response was invalid JSON. Return ONLY valid JSON that matches the schema."
       }
     ];
-    const content = await callOpenAI(client, retryMessages, logger);
+    const content = await callOpenAI(client, retryMessages, schemaName, logger);
     const parsed = safeParseJson(content);
     return schema.parse(parsed);
   }
 }
 
-async function callOpenAI(client, messages, logger) {
+async function callOpenAI(client, messages, schemaName, logger) {
+  const model = process.env.OPENAI_MODEL || "gpt-5-mini";
+  if (schemaName) assertStructuredModel(model);
   const totalChars = messages.reduce((n, m) => n + (m.content?.length || 0), 0);
-  const requestLine = `[openai] request model=${
-    process.env.OPENAI_MODEL || "gpt-4o"
-  } msgs=${messages.length} chars=${totalChars}`;
+  const requestLine = `[openai] request model=${model} msgs=${messages.length} chars=${totalChars}`;
   console.log(requestLine);
   logger?.(requestLine);
   const completion = await client.chat.completions.create({
-    model: process.env.OPENAI_MODEL || "gpt-4o",
+    model,
     messages,
-    response_format: { type: "json_object" },
-    temperature: 0.2
+    response_format: schemaName
+      ? {
+          type: "json_schema",
+          json_schema: {
+            name: `${schemaName}Response`,
+            strict: true,
+            schema: RESPONSE_SCHEMAS[schemaName]
+          }
+        }
+      : { type: "json_object" },
+    ...(model.startsWith("gpt-5") ? {} : { temperature: 0.2 })
   });
   console.log("[openai] response received");
   logger?.("[openai] response received");
   return completion.choices[0]?.message?.content || "{}";
 }
 
+function normalizeSeverity(obj) {
+  if (!obj || typeof obj !== "object") return obj;
+  const clone = Array.isArray(obj) ? obj.map((item) => normalizeSeverity(item)) : { ...obj };
+  if (clone.severity && typeof clone.severity === "string") {
+    const lowered = clone.severity.toLowerCase();
+    if (["high", "medium", "low"].includes(lowered)) clone.severity = lowered;
+  }
+  for (const [key, value] of Object.entries(clone)) {
+    if (Array.isArray(value)) {
+      clone[key] = value.map((item) => normalizeSeverity(item));
+    } else if (value && typeof value === "object") {
+      clone[key] = normalizeSeverity(value);
+    }
+  }
+  return clone;
+}
+
 function safeParseJson(content) {
   try {
-    return JSON.parse(content);
+    return normalizeSeverity(JSON.parse(content));
   } catch {
     const start = content.indexOf("{");
     const end = content.lastIndexOf("}");
@@ -125,7 +378,7 @@ function safeParseJson(content) {
       throw new Error("Model response did not contain JSON.");
     }
     const sliced = content.slice(start, end + 1);
-    return JSON.parse(sliced);
+    return normalizeSeverity(JSON.parse(sliced));
   }
 }
 
@@ -170,6 +423,20 @@ function mockResponse(schema) {
       ]
     };
   }
+  if (schema === SCIENCE_SCHEMA) {
+    return {
+      science_issues: [
+        {
+          category: "baselines",
+          severity: "high",
+          message: "Baselines are underspecified, making comparisons unreliable.",
+          evidence: "The experiments section lists results without naming baseline models.",
+          recommendation: "Specify baseline models and training protocols, and justify their choice.",
+          excerpt: "We compare against strong baselines."
+        }
+      ]
+    };
+  }
   return {
     critique: [
       {
@@ -181,20 +448,54 @@ function mockResponse(schema) {
   };
 }
 
+export function buildStructuralPrompt({
+  preamble,
+  sections,
+  strippedText,
+  paperType,
+  expectations
+}) {
+  const system = "You are the Structural Integrity Agent. Output ONLY JSON.";
+  const user = `Paper type: ${paperType}\nExpectations: ${expectations}\n\nPreamble:\n${preamble}\n\nSection headers:\n${sections
+    .map((s) => `- ${s.level}: ${s.title}`)
+    .join("\n")}\n\nFull text (math stripped):\n${strippedText}\n\nCheck cross-references (\\ref/\\cref) and IMRaD/field structure. Ignore citations/bibliography for now. Return JSON with fix_suggestion for each issue.`;
+  return { system, user };
+}
+
 export async function runStructural({
   preamble,
   sections,
-  fullText,
   strippedText,
   paperType,
   expectations,
   logger
 }) {
-  const system = "You are the Structural Integrity Agent. Output ONLY JSON.";
-  const user = `Paper type: ${paperType}\nExpectations: ${expectations}\n\nPreamble:\n${preamble}\n\nSection headers:\n${sections
-    .map((s) => `- ${s.level}: ${s.title}`)
-    .join("\n")}\n\nFull text (math stripped):\n${strippedText}\n\nCheck cross-references (\\ref/\\cite/\\cref), bibliography, and IMRaD structure. Return JSON with fix_suggestion for each issue.`;
-  return runJsonChat({ system, user, schema: STRUCTURAL_SCHEMA, logger });
+  const { system, user } = buildStructuralPrompt({
+    preamble,
+    sections,
+    strippedText,
+    paperType,
+    expectations
+  });
+  return runJsonChat({
+    system,
+    user,
+    schema: STRUCTURAL_SCHEMA,
+    schemaName: "Structural",
+    logger
+  });
+}
+
+export function buildNotationPrompt({
+  mathEnvs,
+  definitions,
+  preamble,
+  paperType,
+  expectations
+}) {
+  const system = "You are the Notation & Formalism Agent. Output ONLY JSON.";
+  const user = `Paper type: ${paperType}\nExpectations: ${expectations}\n\nPreamble:\n${preamble}\n\nDefinitions/Notation section:\n${definitions}\n\nMath environments (sampled for size):\n${mathEnvs.join("\n\n---\n\n")}\n\nFind undefined symbols, casing inconsistencies, and conflicts. Do not flag common field acronyms (e.g., ML, NLP, AI, GPU) unless in a math paper or if truly ambiguous.`;
+  return { system, user };
 }
 
 export async function runNotation({
@@ -205,36 +506,119 @@ export async function runNotation({
   expectations,
   logger
 }) {
-  const system = "You are the Notation & Formalism Agent. Output ONLY JSON.";
-  const user = `Paper type: ${paperType}\nExpectations: ${expectations}\n\nPreamble:\n${preamble}\n\nDefinitions/Notation section:\n${definitions}\n\nMath environments:\n${mathEnvs.join("\n\n---\n\n")}\n\nFind undefined symbols, casing inconsistencies, and conflicts.`;
-  return runJsonChat({ system, user, schema: NOTATION_SCHEMA, logger });
+  const { system, user } = buildNotationPrompt({
+    mathEnvs,
+    definitions,
+    preamble,
+    paperType,
+    expectations
+  });
+  return runJsonChat({
+    system,
+    user,
+    schema: NOTATION_SCHEMA,
+    schemaName: "Notation",
+    logger
+  });
 }
 
-export async function runRhetoric({ text, paperType, expectations, logger }) {
+export function buildRhetoricPrompt({ text, paperType, expectations, priorIssues, chunkTitle }) {
   const system = "You are the Rhetoric & Logic Agent. Output ONLY JSON.";
-  const user = `Paper type: ${paperType}\nExpectations: ${expectations}\n\nText (sliding window approx):\n${text}\n\nIdentify unsupported claims, clarity issues, or logical fallacies. Provide improvement.`;
-  return runJsonChat({ system, user, schema: RHETORIC_SCHEMA, logger });
+  const prior = priorIssues?.length
+    ? `\n\nPrior issues (avoid duplicates, maintain consistency):\n- ${priorIssues.join("\n- ")}`
+    : "";
+  const title = chunkTitle ? `\n\nSection focus: ${chunkTitle}` : "";
+  const user = `Paper type: ${paperType}\nExpectations: ${expectations}${title}\n\nText (sliding window approx):\n${text}${prior}\n\nIdentify unsupported claims, clarity issues, or logical fallacies. Provide improvement. Return a short excerpt and a line number. If no issues are found, return an empty list.`;
+  return { system, user };
+}
+
+export async function runRhetoric({
+  text,
+  paperType,
+  expectations,
+  priorIssues,
+  chunkTitle,
+  logger
+}) {
+  const { system, user } = buildRhetoricPrompt({
+    text,
+    paperType,
+    expectations,
+    priorIssues,
+    chunkTitle
+  });
+  return runJsonChat({
+    system,
+    user,
+    schema: RHETORIC_SCHEMA,
+    schemaName: "Rhetoric",
+    logger
+  });
+}
+
+export function buildCriticalPrompt({
+  abstract,
+  results,
+  discussion,
+  fullText,
+  paperType,
+  expectations,
+  priorIssues,
+  chunkTitle
+}) {
+  const system = `You are Reviewer #2 — a highly skeptical, senior academic reviewer for a top-tier journal.\nYou are pedantic, rigorous, and unimpressed by grand claims.\nYour goal is to find every reason to reject this paper. Do not offer praise. Do not be polite.\nIdentify hand-wavy logic, insufficient data, over-generalized conclusions, and methodological flaws.\nEvidence Gap: If the author says "it is clear", demand proof.\nNovelty Check: If the author claims a "novel" approach, question if it is merely a trivial variation.\nThe "So What?" Factor: Question the significance of the results.\nAtheistic Stance: Do not assume the authors are right. Assume they are biased toward their own hypothesis.\nOutput ONLY JSON.`;
+  const prior = priorIssues?.length
+    ? `\n\nPrior issues (avoid duplicates, maintain consistency):\n- ${priorIssues.join("\n- ")}`
+    : "";
+  const title = chunkTitle ? `\n\nSection focus: ${chunkTitle}` : "";
+  const user = `Paper type: ${paperType}\nExpectations: ${expectations}${title}\n\nAbstract:\n${abstract}\n\nResults:\n${results}\n\nDiscussion:\n${discussion}\n\nFull paper (core text):\n${fullText}${prior}\n\nReturn critique items with weakness, rebuttal_potential, severity, a short excerpt, and a line number.`;
+  return { system, user };
 }
 
 export async function runCritical({
   abstract,
   results,
   discussion,
+  fullText,
   paperType,
   expectations,
+  priorIssues,
+  chunkTitle,
   logger
 }) {
-  const system = `You are Reviewer #2 — a highly skeptical, senior academic reviewer for a top-tier journal.\nYou are pedantic, rigorous, and unimpressed by grand claims.\nYour goal is to find every reason to reject this paper. Do not offer praise. Do not be polite.\nIdentify hand-wavy logic, insufficient data, over-generalized conclusions, and methodological flaws.\nEvidence Gap: If the author says "it is clear", demand proof.\nNovelty Check: If the author claims a "novel" approach, question if it is merely a trivial variation.\nThe "So What?" Factor: Question the significance of the results.\nAtheistic Stance: Do not assume the authors are right. Assume they are biased toward their own hypothesis.\nOutput ONLY JSON.`;
-  const user = `Paper type: ${paperType}\nExpectations: ${expectations}\n\nAbstract:\n${abstract}\n\nResults:\n${results}\n\nDiscussion:\n${discussion}\n\nReturn critique items with weakness, rebuttal_potential, severity.`;
-  return runJsonChat({ system, user, schema: CRITICAL_SCHEMA, logger });
+  const { system, user } = buildCriticalPrompt({
+    abstract,
+    results,
+    discussion,
+    fullText,
+    paperType,
+    expectations,
+    priorIssues,
+    chunkTitle
+  });
+  return runJsonChat({
+    system,
+    user,
+    schema: CRITICAL_SCHEMA,
+    schemaName: "Critical",
+    logger
+  });
 }
 
 export {
   STRUCTURAL_SCHEMA,
   NOTATION_SCHEMA,
   RHETORIC_SCHEMA,
-  CRITICAL_SCHEMA
+  CRITICAL_SCHEMA,
+  SCIENCE_SCHEMA
 };
+
+export function buildMathPrompt({ artifact, context, paperType, expectations }) {
+  const system =
+    "You are a Math Proof Reviewer. Verify whether the proof for the given artifact is complete and logically sound. Output ONLY JSON.";
+  const user = `Paper type: ${paperType}\nExpectations: ${expectations}\n\nArtifact type: ${artifact.type}\nStatement:\n${artifact.statement}\n\nContext (around statement + proof if present):\n${context}\n\nReturn JSON with fields: artifact_type, verdict (complete|incomplete|missing|unclear), issues (array), recommendation.`;
+  return { system, user };
+}
 
 export async function runMathProof({
   artifact,
@@ -243,14 +627,79 @@ export async function runMathProof({
   expectations,
   logger
 }) {
-  const system =
-    "You are a Math Proof Reviewer. Verify whether the proof for the given artifact is complete and logically sound. Output ONLY JSON.";
-  const user = `Paper type: ${paperType}\nExpectations: ${expectations}\n\nArtifact type: ${artifact.type}\nStatement:\n${artifact.statement}\n\nContext (around statement + proof if present):\n${context}\n\nReturn JSON with fields: artifact_type, verdict (complete|incomplete|missing|unclear), issues (array), recommendation.`;
+  const { system, user } = buildMathPrompt({
+    artifact,
+    context,
+    paperType,
+    expectations
+  });
   const schema = z.object({
     artifact_type: z.string(),
     verdict: z.enum(["complete", "incomplete", "missing", "unclear"]),
     issues: z.array(z.string()),
     recommendation: z.string()
   });
-  return runJsonChat({ system, user, schema, logger });
+  return runJsonChat({
+    system,
+    user,
+    schema,
+    schemaName: "Math",
+    logger
+  });
+}
+
+export function buildSciencePrompt({
+  abstract,
+  methods,
+  experiments,
+  datasets,
+  results,
+  fullText,
+  paperType,
+  expectations,
+  priorIssues,
+  chunkTitle
+}) {
+  const system =
+    "You are the Experimental Science Agent for Machine Learning papers. Focus on empirical rigor, experimental design, and evidence. Output ONLY JSON.";
+  const prior = priorIssues?.length
+    ? `\n\nPrior issues (avoid duplicates, maintain consistency):\n- ${priorIssues.join("\n- ")}`
+    : "";
+  const title = chunkTitle ? `\n\nSection focus: ${chunkTitle}` : "";
+  const user = `Paper type: ${paperType}\nExpectations: ${expectations}${title}\n\nAbstract:\n${abstract}\n\nMethods:\n${methods}\n\nExperiments/Evaluation:\n${experiments}\n\nDatasets:\n${datasets}\n\nResults:\n${results}\n\nFull paper (core text):\n${fullText}${prior}\n\nIdentify issues in experimental design, data, baselines, metrics, ablations, reproducibility, analysis, and claims-vs-evidence. For each issue, include: category, severity, message, evidence (quote/summary), recommendation, excerpt (short snippet), and a line number.`;
+  return { system, user };
+}
+
+export async function runScience({
+  abstract,
+  methods,
+  experiments,
+  datasets,
+  results,
+  fullText,
+  paperType,
+  expectations,
+  priorIssues,
+  chunkTitle,
+  logger
+}) {
+  const { system, user } = buildSciencePrompt({
+    abstract,
+    methods,
+    experiments,
+    datasets,
+    results,
+    fullText,
+    paperType,
+    expectations,
+    priorIssues,
+    chunkTitle
+  });
+  return runJsonChat({
+    system,
+    user,
+    schema: SCIENCE_SCHEMA,
+    schemaName: "Science",
+    logger
+  });
 }

@@ -168,6 +168,17 @@ export function extractDefinitionsSection(text) {
   return m ? m[2] : "";
 }
 
+export function extractSectionContent(text, titles) {
+  const sections = extractSections(text);
+  if (!sections.length) return "";
+  const normalized = titles.map((t) => t.toLowerCase());
+  const match = sections.find((s) => normalized.includes(s.title.toLowerCase()));
+  if (!match) return "";
+  const next = sections.find((s) => s.index > match.index);
+  const endIndex = next ? next.index : text.length;
+  return text.slice(match.index, endIndex);
+}
+
 export function extractAbstractResultsDiscussion(text) {
   const abstract = text.match(/\\begin\{abstract\}([\s\S]*?)\\end\{abstract\}/i);
   const results = text.match(/\\section\*?\{Results\}([\s\S]*?)(?=\\section|\\end\{document\}|$)/i);

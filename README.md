@@ -42,7 +42,9 @@ npm run dev:web
 1) **Structural Integrity** — LaTeX health, IMRaD order, citations.
 2) **Notation & Formalism** — symbol tracking, acronym definitions.
 3) **Rhetoric & Logic** — clarity, unsupported claims.
-4) **Critical Reviewer (Reviewer #2)** — skeptical review, reject‑oriented critique.
+4) **Science (ML Experimental)** — experimental rigor: data, baselines, metrics, ablations.
+5) **Critical Reviewer (Reviewer #2)** — skeptical review, reject‑oriented critique.
+6) **Math Proof Review** — per‑theorem/lemma proof checks (math papers only, streams as it runs).
 
 **Reviewer #2**
 - It is its own dedicated agent (not an aggregation).
@@ -59,8 +61,13 @@ Upload (.tex/.folder)
         +--> Structural Integrity
         +--> Notation & Formalism
         +--> Rhetoric & Logic
+        +--> Science (ML only)
         +--> Critical Reviewer (#2)
+        +--> Math Proof Review (math only, streaming)
         |
         v
-Feedback Summary + Inline Fixes + Reviewer #2 Carousel
+Feedback Summary + Inline Fixes + Science Review + Proof Review
 ```
+
+**Settings**
+- The review page includes a Settings section that shows the exact prompts used per agent.

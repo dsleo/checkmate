@@ -6,6 +6,7 @@ import {
   extractSections,
   extractMathEnvs,
   extractDefinitionsSection,
+  extractSectionContent,
   extractAbstractResultsDiscussion,
   extractTitle,
   extractMacros,
@@ -24,7 +25,14 @@ import {
   runNotation,
   runRhetoric,
   runCritical,
-  runMathProof
+  runMathProof,
+  runScience,
+  buildStructuralPrompt,
+  buildNotationPrompt,
+  buildRhetoricPrompt,
+  buildCriticalPrompt,
+  buildMathPrompt,
+  buildSciencePrompt
 } from "./agents.js";
 
 dotenv.config();
@@ -44,6 +52,35 @@ function mapExcerptToLine(lines, excerpt) {
   if (!needle) return 1;
   const idx = lines.findIndex((line) => line.includes(needle));
   return idx >= 0 ? idx + 1 : 1;
+}
+
+function findBestLineByTokens(lines, excerpt) {
+  if (!excerpt) return 1;
+  const cleaned = excerpt
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!cleaned) return 1;
+  const tokens = cleaned
+    .split(" ")
+    .filter((t) => t.length >= 4)
+    .slice(0, 10);
+  if (!tokens.length) return 1;
+  let bestScore = 0;
+  let bestLine = 1;
+  for (let i = 0; i < lines.length; i += 1) {
+    const windowText = lines.slice(i, i + 2).join(" ").toLowerCase();
+    let score = 0;
+    for (const token of tokens) {
+      if (windowText.includes(token)) score += 1;
+    }
+    if (score > bestScore) {
+      bestScore = score;
+      bestLine = i + 1;
+    }
+  }
+  return bestScore > 0 ? bestLine : 1;
 }
 
 function indexToLine(text, index) {
@@ -92,7 +129,7 @@ function buildRhetoricChunks(text, sections) {
       });
     }
   }
-  const maxChars = 12000;
+  const maxChars = 30000;
   const merged = [];
   let buffer = "";
   for (const chunk of chunks) {
@@ -104,6 +141,54 @@ function buildRhetoricChunks(text, sections) {
     }
   }
   if (buffer) merged.push({ text: buffer });
+  if (merged.length <= 2) return merged;
+  const regrouped = [];
+  let acc = "";
+  for (const item of merged) {
+    if ((acc + item.text).length > maxChars * 2 && acc) {
+      regrouped.push({ text: acc });
+      acc = item.text;
+    } else {
+      acc = acc ? `${acc}\n\n${item.text}` : item.text;
+    }
+  }
+  if (acc) regrouped.push({ text: acc });
+  return regrouped;
+}
+
+function buildSubsectionChunks(text) {
+  const sections = extractSections(text);
+  if (!sections.length) return [{ title: "", text }];
+  const subsectionStarts = sections.filter((s) =>
+    ["subsection", "subsubsection"].includes(s.level)
+  );
+  const boundaries = subsectionStarts.length ? subsectionStarts : sections;
+  const chunks = [];
+  for (let i = 0; i < boundaries.length; i += 1) {
+    const current = boundaries[i];
+    const next = boundaries.find((s) => s.index > current.index);
+    const end = next ? next.index : text.length;
+    const chunkText = text.slice(current.index, end).trim();
+    if (chunkText) {
+      chunks.push({ title: current.title, text: chunkText });
+    }
+  }
+  if (!chunks.length) return [{ title: "", text }];
+  const maxChars = 18000;
+  const merged = [];
+  let buffer = "";
+  let bufferTitle = "";
+  for (const chunk of chunks) {
+    if ((buffer + chunk.text).length > maxChars && buffer) {
+      merged.push({ title: bufferTitle, text: buffer });
+      buffer = chunk.text;
+      bufferTitle = chunk.title;
+    } else {
+      buffer = buffer ? `${buffer}\n\n${chunk.text}` : chunk.text;
+      bufferTitle = bufferTitle || chunk.title;
+    }
+  }
+  if (buffer) merged.push({ title: bufferTitle, text: buffer });
   return merged;
 }
 
@@ -147,7 +232,7 @@ function dedupeByText(items, getText) {
   return result;
 }
 
-function dedupeAcrossAgents({ structural, notation, rhetoric, critical }) {
+function dedupeAcrossAgents({ structural, notation, rhetoric, critical, science }) {
   const seen = [];
   const isDuplicate = (text) => {
     const normalized = normalizeIssueText(text);
@@ -170,6 +255,10 @@ function dedupeAcrossAgents({ structural, notation, rhetoric, critical }) {
   );
   const rhetoricClean = dedupeByText(rhetoric.logic_gaps || [], (i) => i.explanation);
   const criticalClean = dedupeByText(critical.critique || [], (i) => i.weakness);
+  const scienceClean = dedupeByText(
+    science?.science_issues || [],
+    (i) => `${i.category} ${i.message}`
+  );
 
   const structuralFiltered = structuralClean.filter((i) => !isDuplicate(i.message));
   const notationFiltered = notationClean.filter(
@@ -177,12 +266,16 @@ function dedupeAcrossAgents({ structural, notation, rhetoric, critical }) {
   );
   const rhetoricFiltered = rhetoricClean.filter((i) => !isDuplicate(i.explanation));
   const criticalFiltered = criticalClean.filter((i) => !isDuplicate(i.weakness));
+  const scienceFiltered = scienceClean.filter(
+    (i) => !isDuplicate(`${i.category} ${i.message}`)
+  );
 
   return {
     structural: { ...structural, integrity_report: structuralFiltered },
     notation: { ...notation, symbol_analysis: notationFiltered },
     rhetoric: { ...rhetoric, logic_gaps: rhetoricFiltered },
-    critical: { ...critical, critique: criticalFiltered }
+    critical: { ...critical, critique: criticalFiltered },
+    science: science ? { ...science, science_issues: scienceFiltered } : science
   };
 }
 
@@ -206,7 +299,34 @@ function applyHeuristics({
     RNN: "recurrent neural network",
     LLM: "large language model"
   };
+  const commonAcronyms = new Set([
+    "AI",
+    "ML",
+    "NLP",
+    "CNN",
+    "RNN",
+    "LLM",
+    "API",
+    "HTTP",
+    "URL",
+    "CPU",
+    "GPU",
+    "SVM",
+    "PCA",
+    "ROC",
+    "AUC",
+    "F1",
+    "TPU",
+    "SQL",
+    "JSON",
+    "PDF",
+    "RAM",
+    "NLP",
+    "CV",
+    "IR"
+  ]);
   const textLines = text.split("\n");
+  const resolvedPaperType = paperType || detectPaperType(text, sections);
 
   const addedAcronym = new Set();
   const addAcronymSuggestion = (acronym, lineNumber) => {
@@ -255,7 +375,6 @@ function applyHeuristics({
     const section = orderedMatches[i];
     if (!section) continue;
     if (section.index < lastIndex) {
-      const targetGroupIndex = i - 1;
       const anchor = orderedMatches
         .slice(0, i)
         .reverse()
@@ -334,6 +453,7 @@ function applyHeuristics({
       new Set((text.match(/\b[A-Z]{2,}\b/g) || []).filter((t) => t !== "MATH"))
     );
     for (const acronym of acronyms) {
+      if (resolvedPaperType !== "math" && commonAcronyms.has(acronym)) continue;
       if (!definitions || !definitions.includes(acronym)) {
         const lineNumber = mapExcerptToLine(textLines, acronym);
         notation.symbol_analysis.push({
@@ -349,6 +469,7 @@ function applyHeuristics({
   }
 
   for (const item of notation.symbol_analysis || []) {
+    if (resolvedPaperType !== "math" && commonAcronyms.has(item.symbol)) continue;
     if (item.status === "undefined_at_first_use" && item.location?.line) {
       addAcronymSuggestion(item.symbol, item.location.line);
     }
@@ -394,8 +515,6 @@ function applyHeuristics({
   const hasAppendix = /\\appendix/i.test(text);
   const hasMath = (mathEnvs || []).length > 0 || /\$[^$]+\$/.test(text);
 
-  const resolvedPaperType = paperType || detectPaperType(text, sections);
-
   if (!hasAbstract) {
     critical.critique.push({
       weakness: "Missing abstract; the paper is not formatted for academic submission.",
@@ -421,13 +540,6 @@ function applyHeuristics({
     critical.critique.push({
       weakness: "Missing Conclusion; the paper lacks a closing summary and future work.",
       rebuttal_potential: "Add a Conclusion that summarizes contributions and limitations.",
-      severity: "high"
-    });
-  }
-  if (!hasCitations) {
-    critical.critique.push({
-      weakness: "No citations present; claims are not grounded in prior work.",
-      rebuttal_potential: "Add citations to related work and baseline methods.",
       severity: "high"
     });
   }
@@ -601,6 +713,7 @@ function dedupeIssues(issues) {
   });
 }
 
+
 function isActionableLineEdit(text) {
   if (!text) return false;
   if (text.length > 240) return false;
@@ -709,11 +822,40 @@ app.post("/api/review", async (req, res) => {
   const title = extractTitle(latex);
   const macros = extractMacros(preamble);
   const sections = extractSections(maskedText);
+  const sectionsCore = extractSections(coreText);
   const minified = minifyLatex(coreText);
   const stripped = stripHeavyMath(coreText);
   const mathEnvs = extractMathEnvs(coreText);
+  const notationEnvs = [];
+  let notationBudget = 18000;
+  const maxEnvs = 120;
+  for (const env of mathEnvs) {
+    if (notationBudget <= 0 || notationEnvs.length >= maxEnvs) break;
+    const slice = env.length > notationBudget ? env.slice(0, notationBudget) : env;
+    if (!slice.trim()) continue;
+    notationEnvs.push(slice);
+    notationBudget -= slice.length;
+  }
+  if (notationEnvs.length !== mathEnvs.length) {
+    emitLog(
+      `[input] notation envs capped ${notationEnvs.length}/${mathEnvs.length} chars=${18000 - notationBudget}`
+    );
+  }
   const definitions = extractDefinitionsSection(coreText);
   const { abstract, results, discussion } = extractAbstractResultsDiscussion(coreText);
+  const methodsSection = extractSectionContent(coreText, [
+    "Methods",
+    "Method",
+    "Methodology",
+    "Approach"
+  ]);
+  const experimentsSection = extractSectionContent(coreText, [
+    "Experiments",
+    "Evaluation",
+    "Experimental Setup",
+    "Experimental Results"
+  ]);
+  const datasetsSection = extractSectionContent(coreText, ["Dataset", "Datasets", "Data"]);
   const paperType = detectPaperType(coreText, sections);
   const expectations = getPaperExpectations(paperType);
   const artifacts = paperType === "math" ? extractMathArtifacts(coreText) : [];
@@ -817,6 +959,59 @@ app.post("/api/review", async (req, res) => {
 
   const mathPromise = startMathReview();
 
+  const promptCapture = {
+    Structural: null,
+    Notation: null,
+    Rhetoric: [],
+    Critical: null,
+    Science: null,
+    Math: null
+  };
+
+  promptCapture.Structural = buildStructuralPrompt({
+    preamble: minified,
+    sections,
+    strippedText: stripped,
+    paperType,
+    expectations
+  });
+  promptCapture.Notation = buildNotationPrompt({
+    mathEnvs: notationEnvs,
+    definitions,
+    preamble,
+    paperType,
+    expectations
+  });
+  promptCapture.Critical = buildCriticalPrompt({
+    abstract,
+    results,
+    discussion,
+    fullText: coreText,
+    paperType,
+    expectations
+  });
+  if (paperType === "ml") {
+    promptCapture.Science = buildSciencePrompt({
+      abstract,
+      methods: methodsSection,
+      experiments: experimentsSection,
+      datasets: datasetsSection,
+      results,
+      fullText: coreText,
+      paperType,
+      expectations
+    });
+  }
+  promptCapture.Math =
+    paperType === "math"
+      ? buildMathPrompt({
+          artifact: { type: "theorem", statement: "<statement>" },
+          context: "<local context>",
+          paperType,
+          expectations
+        })
+      : null;
+
   const agents = [
     {
       name: "Structural",
@@ -825,7 +1020,6 @@ app.post("/api/review", async (req, res) => {
         runStructural({
           preamble: minified,
           sections,
-          fullText: latex,
           strippedText: stripped,
           paperType,
           expectations,
@@ -837,7 +1031,7 @@ app.post("/api/review", async (req, res) => {
       progress: 50,
       run: () =>
         runNotation({
-          mathEnvs,
+          mathEnvs: notationEnvs,
           definitions,
           preamble,
           paperType,
@@ -849,8 +1043,11 @@ app.post("/api/review", async (req, res) => {
       name: "Rhetoric",
       progress: 75,
       run: async () => {
-        const shouldChunk = coreText.length > 12000 || wordCount > 2000;
+        const shouldChunk = coreText.length > 18000 || wordCount > 2800;
         if (!shouldChunk) {
+          promptCapture.Rhetoric = [
+            buildRhetoricPrompt({ text: coreText, paperType, expectations })
+          ];
           return runRhetoric({
             text: coreText,
             paperType,
@@ -859,41 +1056,248 @@ app.post("/api/review", async (req, res) => {
           });
         }
 
-        const chunks = buildRhetoricChunks(coreText, sections);
+        const chunks = buildSubsectionChunks(coreText);
         emitLog(`[agent] Rhetoric chunked parts=${chunks.length}`);
         const merged = [];
+        const prior = [];
+        promptCapture.Rhetoric = [];
         for (let i = 0; i < chunks.length; i += 1) {
           const chunk = chunks[i];
+          sendEvent(res, "agent-update", {
+            agent: "Rhetoric",
+            status: "processing",
+            progress: 50 + Math.round(((i + 1) / chunks.length) * 35),
+            detail: {
+              phase: "chunk-start",
+              chunkIndex: i + 1,
+              chunkTotal: chunks.length,
+              sectionTitle: chunk.title || "",
+              message: `Chunk ${i + 1}/${chunks.length}${chunk.title ? ` • ${chunk.title}` : ""}`
+            },
+            payload: { logic_gaps: merged }
+          });
+          promptCapture.Rhetoric.push(
+            buildRhetoricPrompt({
+              text: chunk.text,
+              paperType,
+              expectations,
+              priorIssues: prior.slice(-5),
+              chunkTitle: chunk.title
+            })
+          );
           emitLog(`[agent] Rhetoric chunk ${i + 1}/${chunks.length}`);
           const output = await runRhetoric({
             text: chunk.text,
             paperType,
             expectations,
+            priorIssues: prior.slice(-5),
+            chunkTitle: chunk.title,
             logger: emitLog
           });
           merged.push(...(output.logic_gaps || []));
+          output.logic_gaps?.forEach((issue) => {
+            if (issue.explanation) prior.push(issue.explanation.slice(0, 160));
+          });
           sendEvent(res, "agent-update", {
             agent: "Rhetoric",
             status: "processing",
             progress: 50 + Math.round(((i + 1) / chunks.length) * 35),
+            detail: {
+              phase: "chunk-complete",
+              chunkIndex: i + 1,
+              chunkTotal: chunks.length,
+              sectionTitle: chunk.title || "",
+              message: `Chunk ${i + 1}/${chunks.length} done${chunk.title ? ` • ${chunk.title}` : ""}`
+            },
             payload: { logic_gaps: merged }
           });
         }
         return { logic_gaps: merged };
       }
     },
+    ...(paperType === "ml"
+      ? [
+          {
+            name: "Science",
+            progress: 85,
+            run: async () => {
+              const shouldChunk = coreText.length > 18000 || wordCount > 2800;
+              if (!shouldChunk) {
+                promptCapture.Science = buildSciencePrompt({
+                  abstract,
+                  methods: methodsSection,
+                  experiments: experimentsSection,
+                  datasets: datasetsSection,
+                  results,
+                  fullText: coreText,
+                  paperType,
+                  expectations
+                });
+                return runScience({
+                  abstract,
+                  methods: methodsSection,
+                  experiments: experimentsSection,
+                  datasets: datasetsSection,
+                  results,
+                  fullText: coreText,
+                  paperType,
+                  expectations,
+                  logger: emitLog
+                });
+              }
+
+              const chunks = buildSubsectionChunks(coreText);
+              emitLog(`[agent] Science chunked parts=${chunks.length}`);
+              const merged = [];
+              const prior = [];
+              promptCapture.Science = [];
+              for (let i = 0; i < chunks.length; i += 1) {
+                const chunk = chunks[i];
+                sendEvent(res, "agent-update", {
+                  agent: "Science",
+                  status: "processing",
+                  progress: 60 + Math.round(((i + 1) / chunks.length) * 30),
+                  detail: {
+                    phase: "chunk-start",
+                    chunkIndex: i + 1,
+                    chunkTotal: chunks.length,
+                    sectionTitle: chunk.title || "",
+                    message: `Chunk ${i + 1}/${chunks.length}${chunk.title ? ` • ${chunk.title}` : ""}`
+                  },
+                  payload: { science_issues: merged }
+                });
+                promptCapture.Science.push(
+                  buildSciencePrompt({
+                    abstract,
+                    methods: methodsSection,
+                    experiments: experimentsSection,
+                    datasets: datasetsSection,
+                    results,
+                    fullText: chunk.text,
+                    paperType,
+                    expectations,
+                    priorIssues: prior.slice(-5),
+                    chunkTitle: chunk.title
+                  })
+                );
+                emitLog(`[agent] Science chunk ${i + 1}/${chunks.length}`);
+                const output = await runScience({
+                  abstract,
+                  methods: methodsSection,
+                  experiments: experimentsSection,
+                  datasets: datasetsSection,
+                  results,
+                  fullText: chunk.text,
+                  paperType,
+                  expectations,
+                  priorIssues: prior.slice(-5),
+                  chunkTitle: chunk.title,
+                  logger: emitLog
+                });
+                merged.push(...(output.science_issues || []));
+                output.science_issues?.forEach((issue) => {
+                  if (issue.message) prior.push(issue.message.slice(0, 160));
+                });
+                sendEvent(res, "agent-update", {
+                  agent: "Science",
+                  status: "processing",
+                  progress: 60 + Math.round(((i + 1) / chunks.length) * 30),
+                  detail: {
+                    phase: "chunk-complete",
+                    chunkIndex: i + 1,
+                    chunkTotal: chunks.length,
+                    sectionTitle: chunk.title || "",
+                    message: `Chunk ${i + 1}/${chunks.length} done${chunk.title ? ` • ${chunk.title}` : ""}`
+                  },
+                  payload: { science_issues: merged }
+                });
+              }
+              return { science_issues: merged };
+            }
+          }
+        ]
+      : []),
     {
       name: "Critical",
-      progress: 90,
-      run: () =>
-        runCritical({
-          abstract,
-          results,
-          discussion,
-          paperType,
-          expectations,
-          logger: emitLog
-        })
+      progress: 95,
+      run: async () => {
+        const shouldChunk = coreText.length > 18000 || wordCount > 2800;
+        if (!shouldChunk) {
+          return runCritical({
+            abstract,
+            results,
+            discussion,
+            fullText: coreText,
+            paperType,
+            expectations,
+            logger: emitLog
+          });
+        }
+
+        const chunks = buildSubsectionChunks(coreText);
+        emitLog(`[agent] Critical chunked parts=${chunks.length}`);
+        const merged = [];
+        const prior = [];
+        promptCapture.Critical = [];
+        for (let i = 0; i < chunks.length; i += 1) {
+          const chunk = chunks[i];
+          sendEvent(res, "agent-update", {
+            agent: "Critical",
+            status: "processing",
+            progress: 70 + Math.round(((i + 1) / chunks.length) * 25),
+            detail: {
+              phase: "chunk-start",
+              chunkIndex: i + 1,
+              chunkTotal: chunks.length,
+              sectionTitle: chunk.title || "",
+              message: `Chunk ${i + 1}/${chunks.length}${chunk.title ? ` • ${chunk.title}` : ""}`
+            },
+            payload: { critique: merged }
+          });
+          promptCapture.Critical.push(
+            buildCriticalPrompt({
+              abstract,
+              results,
+              discussion,
+              fullText: chunk.text,
+              paperType,
+              expectations,
+              priorIssues: prior.slice(-5),
+              chunkTitle: chunk.title
+            })
+          );
+          emitLog(`[agent] Critical chunk ${i + 1}/${chunks.length}`);
+          const output = await runCritical({
+            abstract,
+            results,
+            discussion,
+            fullText: chunk.text,
+            paperType,
+            expectations,
+            priorIssues: prior.slice(-5),
+            chunkTitle: chunk.title,
+            logger: emitLog
+          });
+          merged.push(...(output.critique || []));
+          output.critique?.forEach((issue) => {
+            if (issue.weakness) prior.push(issue.weakness.slice(0, 160));
+          });
+          sendEvent(res, "agent-update", {
+            agent: "Critical",
+            status: "processing",
+            progress: 70 + Math.round(((i + 1) / chunks.length) * 25),
+            detail: {
+              phase: "chunk-complete",
+              chunkIndex: i + 1,
+              chunkTotal: chunks.length,
+              sectionTitle: chunk.title || "",
+              message: `Chunk ${i + 1}/${chunks.length} done${chunk.title ? ` • ${chunk.title}` : ""}`
+            },
+            payload: { critique: merged }
+          });
+        }
+        return { critique: merged };
+      }
     }
   ];
 
@@ -934,10 +1338,17 @@ app.post("/api/review", async (req, res) => {
     Structural: { integrity_report: [] },
     Notation: { symbol_analysis: [] },
     Rhetoric: { logic_gaps: [] },
-    Critical: { critique: [] }
+    Critical: { critique: [] },
+    Science: { science_issues: [] }
   };
   const agentPromises = agents.map(async (agent) => {
     try {
+      sendEvent(res, "agent-update", {
+        agent: agent.name,
+        status: "processing",
+        progress: 8,
+        detail: { phase: "llm-call", message: "Calling model" }
+      });
       emitLog(
         `[agent] ${agent.name} input chars=${
           agent.name === "Structural"
@@ -984,12 +1395,51 @@ app.post("/api/review", async (req, res) => {
   const notation = resultsMap.Notation;
   const rhetoric = resultsMap.Rhetoric;
   const critical = resultsMap.Critical;
+  const science = resultsMap.Science;
 
-  const deduped = dedupeAcrossAgents({ structural, notation, rhetoric, critical });
+  const attachLine = (item, fallback) => {
+    if (item.location?.line && item.location.line > 1) return item;
+    const excerpt = item.excerpt || fallback || "";
+    let line = mapExcerptToLine(lines, excerpt);
+    if (line === 1) {
+      line = findBestLineByTokens(lines, excerpt);
+    }
+    return { ...item, location: { line } };
+  };
+
+  const rhetoricWithLines = {
+    ...rhetoric,
+    logic_gaps: (rhetoric.logic_gaps || []).map((item) =>
+      attachLine(item, item.excerpt || item.explanation)
+    )
+  };
+  const criticalWithLines = {
+    ...critical,
+    critique: (critical.critique || []).map((item) =>
+      attachLine(item, item.excerpt || item.weakness)
+    )
+  };
+  const scienceWithLines = science
+    ? {
+        ...science,
+        science_issues: (science.science_issues || []).map((item) =>
+          attachLine(item, item.excerpt || item.message)
+        )
+      }
+    : science;
+
+  const deduped = dedupeAcrossAgents({
+    structural,
+    notation,
+    rhetoric: rhetoricWithLines,
+    critical: criticalWithLines,
+    science: scienceWithLines
+  });
   const structuralFinal = deduped.structural;
   const notationFinal = deduped.notation;
   const rhetoricFinal = deduped.rhetoric;
   const criticalFinal = deduped.critical;
+  const scienceFinal = deduped.science;
 
   const heuristicSuggestions = applyHeuristics({
     structural: structuralFinal,
@@ -1036,11 +1486,13 @@ app.post("/api/review", async (req, res) => {
       notation: notationFinal,
       rhetoric: rhetoricFinal,
       critical: criticalFinal,
+      science: paperType === "ml" ? scienceFinal || { science_issues: [] } : null,
       math: {
         status: paperType === "math" ? "processing" : "skipped",
         summary: paperType === "math" ? "Math proof review in progress." : "",
         results: []
       },
+      prompts: promptCapture,
       suggestions: suggestionsWithIds,
       patches
     }
