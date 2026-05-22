@@ -1,8 +1,7 @@
-import React, { useRef, useState, useEffect } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 
 export default function HomePage({
-  latex,
   fileError,
   files,
   selectedFile,
@@ -14,7 +13,6 @@ export default function HomePage({
   math,
   macroText,
   macroFileName,
-  handleLatexChange,
   handleFileSelection,
   loadSelectedFile,
   startReview

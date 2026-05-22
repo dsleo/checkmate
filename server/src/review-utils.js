@@ -44,6 +44,21 @@ export function buildRhetoricChunks(text, sections) {
   return regrouped;
 }
 
+export function buildSubsectionChunks(text) {
+  const sections = extractSections(text);
+  const subsectionStarts = sections.filter((s) => s.level === "subsection");
+  if (!subsectionStarts.length) return buildSectionChunks(text);
+  return subsectionStarts.map((current, idx) => {
+    const next = subsectionStarts[idx + 1];
+    const end = next ? next.index : text.length;
+    return {
+      title: current.title,
+      level: current.level,
+      text: text.slice(current.index, end).trim()
+    };
+  }).filter((chunk) => chunk.text);
+}
+
 export function buildSectionChunks(text) {
   const sections = extractSections(text);
   if (!sections.length) return [{ title: "", text }];
@@ -171,22 +186,33 @@ export function findBestLineByTokens(lines, excerpt) {
   if (!excerpt) return 1;
   const cleaned = excerpt
     .toLowerCase()
-    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/[^a-z0-9\s-]/g, " ")
+    .replace(/-+/g, "")
     .replace(/\s+/g, " ")
     .trim();
   if (!cleaned) return 1;
   const tokens = cleaned
     .split(" ")
+    .map((t) => (t.length > 4 && t.endsWith("s") ? t.slice(0, -1) : t))
     .filter((t) => t.length >= 4)
     .slice(0, 10);
   if (!tokens.length) return 1;
   let bestScore = 0;
   let bestLine = 1;
   for (let i = 0; i < lines.length; i += 1) {
-    const windowText = lines.slice(i, i + 2).join(" ").toLowerCase();
+    const windowText = lines
+      .slice(i, i + 1)
+      .join(" ")
+      .toLowerCase()
+      .replace(/[^a-z0-9\s-]/g, " ")
+      .replace(/-+/g, "");
+    const normalizedWindow = windowText
+      .split(/\s+/)
+      .map((t) => (t.length > 4 && t.endsWith("s") ? t.slice(0, -1) : t))
+      .join(" ");
     let score = 0;
     for (const token of tokens) {
-      if (windowText.includes(token)) score += 1;
+      if (normalizedWindow.includes(token)) score += 1;
     }
     if (score > bestScore) {
       bestScore = score;

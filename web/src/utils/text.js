@@ -6,6 +6,7 @@ export function stripLatexInline(text) {
     .replace(/\\\[[\s\S]*?\\\]/g, " ")
     .replace(/\$[^$]*\$/g, " ")
     .replace(/[{}]/g, " ")
+    .replace(/[^a-zA-Z0-9\s-]/g, " ")
     .replace(/\s+/g, " ")
     .trim()
     .toLowerCase();
@@ -14,6 +15,8 @@ export function stripLatexInline(text) {
 export function tokenize(text) {
   return stripLatexInline(text)
     .split(" ")
+    .map((t) => t.replace(/-+/g, ""))
+    .map((t) => (t.length > 4 && t.endsWith("s") ? t.slice(0, -1) : t))
     .filter((t) => t.length >= 3);
 }
 

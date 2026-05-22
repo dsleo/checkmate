@@ -1,8 +1,8 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import katex from "katex";
 import { useNavigate } from "react-router-dom";
-import { DiffEditor } from "@monaco-editor/react";
-import { findLineFromExcerpt, findBestSentenceRange, resolveJumpLine } from "../utils/text.js";
+import { DiffEditor, Editor } from "@monaco-editor/react";
+import { findBestSentenceRange, resolveJumpLine } from "../utils/text.js";
 
 function normalizeLatex(text) {
   if (!text) return "";
@@ -41,25 +41,62 @@ function renderMathInline(text, macros) {
   return html;
 }
 
-function jumpToLine(textAreaRef, text, line, hintText) {
+function getRangeForHint(text, line, hintText, editorRef) {
   const lines = text.split("\n");
   const safeLine = Math.max(1, Math.min(lines.length, line || 1));
   const lineStartIndex = lines.slice(0, safeLine - 1).join("\n").length;
   const range = findBestSentenceRange(text, hintText, lineStartIndex);
+  const model = editorRef.current?.getModel();
+  if (!model) return null;
+  const start = model.getPositionAt(range.start);
+  const end = model.getPositionAt(range.end);
+  return {
+    startLineNumber: start.lineNumber,
+    startColumn: start.column,
+    endLineNumber: end.lineNumber,
+    endColumn: Math.max(end.column, start.column + 1)
+  };
+}
 
-  if (textAreaRef.current) {
-    textAreaRef.current.focus();
-    textAreaRef.current.setSelectionRange(range.start, range.end);
-    textAreaRef.current.scrollIntoView({
-      behavior: "smooth",
-      block: "center"
-    });
+function revealComment(editorRef, text, line, hintText) {
+  const editor = editorRef.current;
+  const model = editor?.getModel();
+  if (!editor || !model) return;
+  const resolvedLine = resolveJumpLine(text, line, hintText);
+  const range = getRangeForHint(text, resolvedLine, hintText, editorRef);
+  if (!range) return;
+  const monacoRange = {
+    startLineNumber: range.startLineNumber,
+    startColumn: range.startColumn,
+    endLineNumber: range.endLineNumber,
+    endColumn: range.endColumn
+  };
+  editor.focus();
+  editor.setSelection(monacoRange);
+  editor.revealRangeInCenter(monacoRange, 1);
+}
+
+function rangeContainsPosition(range, position) {
+  if (!range || !position) return false;
+  if (position.lineNumber < range.startLineNumber) return false;
+  if (position.lineNumber > range.endLineNumber) return false;
+  if (
+    position.lineNumber === range.startLineNumber &&
+    position.column < range.startColumn
+  ) {
+    return false;
   }
+  if (
+    position.lineNumber === range.endLineNumber &&
+    position.column > range.endColumn
+  ) {
+    return false;
+  }
+  return true;
 }
 
 export default function ReviewPage({
   latex,
-  textAreaRef,
   results,
   progress,
   status,
@@ -70,10 +107,6 @@ export default function ReviewPage({
   macroText,
   reviewCompleteAt,
   suggestions,
-  structural,
-  notation,
-  rhetoric,
-  critical,
   science,
   summaryItems,
   activeSuggestion,
@@ -92,9 +125,18 @@ export default function ReviewPage({
 }) {
   const navigate = useNavigate();
   const downloadRef = useRef(null);
+  const editorRef = useRef(null);
+  const monacoRef = useRef(null);
+  const decorationIdsRef = useRef([]);
+  const commentRangesRef = useRef([]);
+  const commentCardRefs = useRef(new Map());
   const [agentFilter, setAgentFilter] = useState("All");
   const [expandedRebuttals, setExpandedRebuttals] = useState(new Set());
   const [openGroups, setOpenGroups] = useState(new Set());
+  const [activeCommentId, setActiveCommentId] = useState(null);
+  const [relatedCommentIds, setRelatedCommentIds] = useState(new Set());
+  const [editorReady, setEditorReady] = useState(false);
+  const [reviewViewMode, setReviewViewMode] = useState("comments");
   const hasInitOpenRef = useRef(false);
   const prevFilterRef = useRef(agentFilter);
   const proofCarouselRef = useRef(null);
@@ -106,6 +148,115 @@ export default function ReviewPage({
   const agentList = hasScience
     ? ["Structural", "Notation", "Rhetoric", "Science", "Critical"]
     : ["Structural", "Notation", "Rhetoric", "Critical"];
+  const commentItems = useMemo(() => {
+    const items = [];
+    Object.entries(summaryItems || {}).forEach(([group, groupItems]) => {
+      groupItems.forEach((item, idx) => {
+        const actionable = suggestions.find(
+          (s) => s.actionable !== false && s.agent === item.agent && s.line === item.line
+        );
+        items.push({
+          id: `${item.agent}-${group}-${item.line}-${idx}`,
+          group,
+          agent: item.agent,
+          severity: item.severity,
+          text: item.text,
+          line: item.line,
+          excerpt: item.excerpt || item.text,
+          actionable
+        });
+      });
+    });
+    (science || []).forEach((item, idx) => {
+      items.push({
+        id: `Science-${item.location?.line || 1}-${idx}`,
+        group: item.category || "Science",
+        agent: "Science",
+        severity: item.severity || "medium",
+        text: item.message,
+        line: item.location?.line || 1,
+        excerpt: item.excerpt || item.message
+      });
+    });
+    (math?.results || []).forEach((item, idx) => {
+      const severity = item.verdict === "complete" ? "low" : "high";
+      items.push({
+        id: `Proof-${idx}`,
+        group: "Proof Review",
+        agent: "Proof",
+        severity,
+        text: `${item.type || "Proof"}: ${item.verdict}`,
+        line: 0,
+        excerpt: item.statement || ""
+      });
+    });
+    return items;
+  }, [summaryItems, suggestions, science, math?.results]);
+
+  const revealReviewItem = (item) => {
+    setActiveCommentId(item.id);
+    setRelatedCommentIds(new Set([item.id]));
+    revealComment(editorRef, latex, item.line, item.excerpt || item.text);
+  };
+
+  useEffect(() => {
+    const editor = editorRef.current;
+    const monaco = monacoRef.current;
+    if (!editorReady || !editor || !monaco) return;
+    const ranges = [];
+    const decorations = commentItems
+      .map((item) => {
+        const resolvedLine = resolveJumpLine(latex, item.line, item.excerpt || item.text);
+        const range = getRangeForHint(latex, resolvedLine, item.excerpt || item.text, editorRef);
+        if (!range) return null;
+        ranges.push({ item, range });
+        const isActive = item.id === activeCommentId;
+        return {
+          range: new monaco.Range(
+            range.startLineNumber,
+            range.startColumn,
+            range.endLineNumber,
+            range.endColumn
+          ),
+          options: {
+            className: `review-anchor review-anchor-${item.severity || "medium"} ${
+              isActive ? "review-anchor-active" : ""
+            }`,
+            hoverMessage: { value: `**${item.agent}**: ${item.text}` },
+            overviewRuler: {
+              color:
+                item.severity === "high"
+                  ? "#b3462f"
+                  : item.severity === "medium"
+                    ? "#c79243"
+                    : "#6f8f63",
+              position: monaco.editor.OverviewRulerLane.Right
+            }
+          }
+        };
+      })
+      .filter(Boolean);
+    commentRangesRef.current = ranges;
+    decorationIdsRef.current = editor.deltaDecorations(
+      decorationIdsRef.current,
+      decorations
+    );
+  }, [commentItems, latex, activeCommentId, editorReady]);
+
+  const activateCommentsAtPosition = (position) => {
+    const matching = commentRangesRef.current.filter(({ range }) =>
+      rangeContainsPosition(range, position)
+    );
+    if (!matching.length) return;
+    const ids = new Set(matching.map(({ item }) => item.id));
+    const first = matching[0].item;
+    setRelatedCommentIds(ids);
+    setActiveCommentId(first.id);
+    commentCardRefs.current.get(first.id)?.scrollIntoView({
+      behavior: "smooth",
+      block: "nearest"
+    });
+  };
 
   useEffect(() => {
     if (!reviewCompleteAt) return;
@@ -393,7 +544,10 @@ export default function ReviewPage({
                         <ul className="summary-severity-list">
                           {bucket.map((item, idx) => {
                             const actionable = suggestions.find(
-                              (s) => s.agent === item.agent && s.line === item.line
+                              (s) =>
+                                s.actionable !== false &&
+                                s.agent === item.agent &&
+                                s.line === item.line
                             );
                             const isActive =
                               actionable && activeSummaryFixId === actionable.id;
@@ -403,15 +557,10 @@ export default function ReviewPage({
                                 <button
                                   className="summary-jump"
                                   onClick={() => {
-                                    const targetLine = resolveJumpLine(
+                                    revealComment(
+                                      editorRef,
                                       latex,
                                       item.line,
-                                      item.excerpt || item.text
-                                    );
-                                    jumpToLine(
-                                      textAreaRef,
-                                      latex,
-                                      targetLine,
                                       item.excerpt || item.text
                                     );
                                   }}
@@ -545,10 +694,10 @@ export default function ReviewPage({
                                 <button
                                   className="summary-jump"
                                   onClick={() =>
-                                    jumpToLine(
-                                      textAreaRef,
+                                    revealComment(
+                                      editorRef,
                                       latex,
-                                      resolveJumpLine(latex, 0, item.excerpt),
+                                      item.location?.line || 0,
                                       item.excerpt || item.message
                                     )
                                   }
@@ -625,12 +774,7 @@ export default function ReviewPage({
                 <button
                   className="summary-jump"
                   onClick={() => {
-                    const targetLine = resolveJumpLine(
-                      latex,
-                      0,
-                      item.statement || ""
-                    );
-                    jumpToLine(textAreaRef, latex, targetLine, item.statement || "");
+                    revealComment(editorRef, latex, 0, item.statement || "");
                   }}
                   title="Jump to text"
                   aria-label="Jump to text"
@@ -703,12 +847,105 @@ export default function ReviewPage({
               </div>
             </div>
           </div>
-          <textarea
-            ref={textAreaRef}
-            className="latex-input"
-            value={latex}
-            onChange={(e) => handleLatexChange(e.target.value)}
-          />
+          <div className="review-view-toggle" aria-label="Review view mode">
+            <button
+              type="button"
+              className={reviewViewMode === "comments" ? "active" : ""}
+              onClick={() => setReviewViewMode("comments")}
+            >
+              Commented
+            </button>
+            <button
+              type="button"
+              className={reviewViewMode === "source" ? "active" : ""}
+              onClick={() => setReviewViewMode("source")}
+            >
+              Source
+            </button>
+          </div>
+          <div
+            className={`review-workbench ${
+              reviewViewMode === "source" ? "source-mode" : ""
+            }`}
+          >
+            <div className="source-editor-shell">
+              <Editor
+                height={reviewViewMode === "source" ? "720px" : "640px"}
+                language="latex"
+                value={latex}
+                onChange={(value) => handleLatexChange(value || "")}
+                onMount={(editor, monaco) => {
+                  editorRef.current = editor;
+                  monacoRef.current = monaco;
+                  editor.onMouseDown((event) => {
+                    if (event.target?.position) {
+                      activateCommentsAtPosition(event.target.position);
+                    }
+                  });
+                  setEditorReady(true);
+                }}
+                options={{
+                  wordWrap: "on",
+                  minimap: { enabled: false },
+                  fontSize: 14,
+                  lineHeight: 22,
+                  scrollBeyondLastLine: false,
+                  automaticLayout: true,
+                  renderLineHighlight: "all",
+                  padding: { top: 16, bottom: 16 },
+                  overviewRulerBorder: false
+                }}
+              />
+            </div>
+            {reviewViewMode === "comments" && (
+              <aside className="comment-rail" aria-label="Review comments">
+                <div className="comment-rail-header">
+                  <span>Comments</span>
+                  <span>{commentItems.length}</span>
+                </div>
+                {commentItems.length ? (
+                  <div className="comment-list">
+                    {commentItems.map((item) => (
+                      <button
+                        key={item.id}
+                        ref={(node) => {
+                          if (node) commentCardRefs.current.set(item.id, node);
+                          else commentCardRefs.current.delete(item.id);
+                        }}
+                        type="button"
+                        className={`comment-card ${item.severity || "medium"} ${
+                          activeCommentId === item.id ? "active" : ""
+                        } ${
+                          relatedCommentIds.has(item.id) ? "related" : ""
+                        }`}
+                        onClick={() => revealReviewItem(item)}
+                      >
+                        <span className="comment-meta">
+                          <span>{item.agent}</span>
+                          <span>{item.line ? `Line ${item.line}` : item.group}</span>
+                        </span>
+                        <span className="comment-text">{item.text}</span>
+                        {item.actionable && (
+                          <span
+                            className="comment-fix"
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              setActiveCommentId(item.id);
+                              openSuggestion(item.actionable);
+                            }}
+                          >
+                            Open fix
+                          </span>
+                        )}
+                      </button>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="muted">No anchored comments yet.</p>
+                )}
+              </aside>
+            )}
+          </div>
         </div>
       </section>
 

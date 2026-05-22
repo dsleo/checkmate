@@ -1,6 +1,23 @@
 const SECTION_RE = /\\(section|subsection|subsubsection)\*?\{([^}]*)\}/g;
 const COMMENT_RE = /%.*$/gm;
 
+function readBracedArgument(text, command) {
+  const commandIndex = text.search(new RegExp(`\\\\${command}\\s*\\{`, "i"));
+  if (commandIndex === -1) return "";
+  const openIndex = text.indexOf("{", commandIndex);
+  if (openIndex === -1) return "";
+  let depth = 0;
+  for (let i = openIndex; i < text.length; i += 1) {
+    const char = text[i];
+    if (char === "{") depth += 1;
+    if (char === "}") {
+      depth -= 1;
+      if (depth === 0) return text.slice(openIndex + 1, i);
+    }
+  }
+  return "";
+}
+
 export function splitLines(text) {
   return text.replace(/\r\n?/g, "\n").split("\n");
 }
@@ -12,9 +29,8 @@ export function extractPreamble(text) {
 }
 
 export function extractTitle(text) {
-  const m = text.match(/\\title\{([\s\S]*?)\}/i);
-  if (!m) return "";
-  let title = m[1];
+  let title = readBracedArgument(text, "title");
+  if (!title) return "";
   // Strip common LaTeX commands while preserving their content.
   title = title.replace(/\\textbf\{([\s\S]*?)\}/gi, "$1");
   title = title.replace(/\\textit\{([\s\S]*?)\}/gi, "$1");

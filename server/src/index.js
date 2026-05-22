@@ -175,6 +175,7 @@ function applyHeuristics({
     extraSuggestions.push({
       agent: "Notation",
       line: lineNumber,
+      original: originalLine,
       suggestion: updatedLine,
       reason: `Define ${acronym} on first use.`,
       kind: "replace",
@@ -550,12 +551,14 @@ function consolidateSuggestions({ structural, rhetoric, lines }) {
 
   for (const item of structural.integrity_report || []) {
     if (item.fix_suggestion && item.location?.line) {
+      const original = getLineContext(lines, item.location.line, 0);
       suggestions.push({
         agent: "Structural",
         line: item.location.line,
         suggestion: item.fix_suggestion,
         reason: item.message,
-        actionable: true
+        original,
+        actionable: isActionableLineEdit(item.fix_suggestion)
       });
     }
   }
@@ -564,11 +567,14 @@ function consolidateSuggestions({ structural, rhetoric, lines }) {
     const line = mapExcerptToLine(lines, item.excerpt);
     if (item.improvement) {
       const actionable = isActionableLineEdit(item.improvement);
+      const original = getLineContext(lines, line, 0);
       suggestions.push({
         agent: "Rhetoric",
         line,
         suggestion: item.improvement,
         reason: item.explanation,
+        excerpt: item.excerpt,
+        original,
         actionable
       });
     }
@@ -1118,7 +1124,8 @@ app.post("/api/review", async (req, res) => {
                   results,
                   fullText: coreText,
                   paperType,
-                  expectations
+                  expectations,
+                  evidenceSummary
                 });
                 return runScience({
                   abstract,
@@ -1129,6 +1136,7 @@ app.post("/api/review", async (req, res) => {
                   fullText: coreText,
                   paperType,
                   expectations,
+                  evidenceSummary,
                   logger: emitLog
                 });
               }
@@ -1206,11 +1214,7 @@ app.post("/api/review", async (req, res) => {
                   });
                   break;
                 }
-                const safeCategories = new Set(["metrics", "baselines", "reproducibility"]);
-                const safeIssues = (output.science_issues || []).filter((issue) =>
-                  safeCategories.has(issue.category)
-                );
-                merged.push(...safeIssues);
+                merged.push(...(output.science_issues || []));
                 (output.science_issues || []).forEach((issue, idx) => {
                   staged.push({
                     id: `science-${i}-${idx}`,
@@ -1293,6 +1297,7 @@ app.post("/api/review", async (req, res) => {
             fullText: coreText,
             paperType,
             expectations,
+            evidenceSummary,
             logger: emitLog
           });
         }
@@ -1365,15 +1370,7 @@ app.post("/api/review", async (req, res) => {
             });
             break;
           }
-          const safeIssues = (output.critique || []).filter((issue) => {
-            const text = `${issue.weakness || ""} ${issue.excerpt || ""}`.toLowerCase();
-            const risky =
-              /missing|not provided|absent|lacks|no results|no discussion|no experiments|no evaluation|no dataset|no data|no table|no figure|insufficient evidence|unsupported/i.test(
-                text
-              );
-            return !risky;
-          });
-          merged.push(...safeIssues);
+          merged.push(...(output.critique || []));
           (output.critique || []).forEach((issue, idx) => {
             staged.push({
               id: `critical-${i}-${idx}`,
