@@ -598,6 +598,7 @@ export async function runCritical({
   expectations,
   priorIssues,
   chunkTitle,
+  evidenceSummary,
   logger
 }) {
   const { system, user } = buildCriticalPrompt({
@@ -608,7 +609,8 @@ export async function runCritical({
     paperType,
     expectations,
     priorIssues,
-    chunkTitle
+    chunkTitle,
+    evidenceSummary
   });
   return runJsonChat({
     system,
@@ -720,6 +722,8 @@ export async function runResolveIssues({
   paperType,
   expectations,
   agent,
+  evidenceSummary,
+  sectionEvidence,
   logger
 }) {
   const { system, user } = buildResolvePrompt({
@@ -727,7 +731,9 @@ export async function runResolveIssues({
     sectionTitles,
     paperType,
     expectations,
-    agent
+    agent,
+    evidenceSummary,
+    sectionEvidence
   });
   return runJsonChat({
     system,
@@ -749,6 +755,7 @@ export async function runScience({
   expectations,
   priorIssues,
   chunkTitle,
+  evidenceSummary,
   logger
 }) {
   const { system, user } = buildSciencePrompt({
@@ -761,7 +768,8 @@ export async function runScience({
     paperType,
     expectations,
     priorIssues,
-    chunkTitle
+    chunkTitle,
+    evidenceSummary
   });
   return runJsonChat({
     system,

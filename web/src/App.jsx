@@ -1,8 +1,9 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
-import { BrowserRouter, Routes, Route } from "react-router-dom";
+import { useMemo, useRef, useState } from "react";
+import { BrowserRouter, HashRouter, Routes, Route } from "react-router-dom";
 import { applyPatch, compare } from "fast-json-patch";
 import HomePage from "./components/HomePage.jsx";
 import ReviewPage from "./components/ReviewPage.jsx";
+import { resolveJumpLine } from "./utils/text.js";
 
 const DEFAULT_LATEX = `\\documentclass{article}
 \\begin{document}
@@ -11,6 +12,7 @@ It is obvious that our method outperforms baselines.
 \\section{Methods}
 We evaluate on NLP datasets.
 \\end{document}`;
+const EMPTY_ARRAY = [];
 
 function parseSSEChunk(chunk) {
   const events = [];
@@ -45,6 +47,13 @@ function downloadText(filename, text) {
   URL.revokeObjectURL(url);
 }
 
+function getApiBase() {
+  if (typeof window !== "undefined" && window.location.protocol === "file:") {
+    return "http://127.0.0.1:8787";
+  }
+  return "";
+}
+
 function moveBlockLines(lines, fromStart, fromEnd, toAfterLine) {
   const start = Math.max(0, fromStart - 1);
   const end = Math.min(lines.length - 1, fromEnd - 1);
@@ -65,7 +74,9 @@ function moveBlockLines(lines, fromStart, fromEnd, toAfterLine) {
 
 
 export default function App() {
-  const textAreaRef = useRef(null);
+  const Router = typeof window !== "undefined" && window.location.protocol === "file:"
+    ? HashRouter
+    : BrowserRouter;
   const [latex, setLatex] = useState(DEFAULT_LATEX);
   const [doc, setDoc] = useState({ lines: DEFAULT_LATEX.split("\n") });
   const [progress, setProgress] = useState(0);
@@ -96,15 +107,15 @@ export default function App() {
   const suggestions = (results?.payload?.suggestions || []).filter(
     (item) => !acceptedIds.has(item.id)
   );
-  const structuralRaw = results?.payload?.structural?.integrity_report || [];
+  const structuralRaw = results?.payload?.structural?.integrity_report || EMPTY_ARRAY;
   const structural = structuralRaw.filter(
     (item) =>
       !resolvedReports.has(`Structural-${item.location?.line || 1}-${item.message}`)
   );
-  const notation = results?.payload?.notation?.symbol_analysis || [];
-  const rhetoric = results?.payload?.rhetoric?.logic_gaps || [];
-  const critical = results?.payload?.critical?.critique || [];
-  const science = results?.payload?.science?.science_issues || [];
+  const notation = results?.payload?.notation?.symbol_analysis || EMPTY_ARRAY;
+  const rhetoric = results?.payload?.rhetoric?.logic_gaps || EMPTY_ARRAY;
+  const critical = results?.payload?.critical?.critique || EMPTY_ARRAY;
+  const science = results?.payload?.science?.science_issues || EMPTY_ARRAY;
   const math = results?.payload?.math || { status: "idle", summary: "", results: [] };
   const macros = results?.payload?.macros || {};
   const prompts = results?.payload?.prompts || {};
@@ -202,7 +213,7 @@ export default function App() {
     const sortGroup = (arr) => arr.sort((a, b) => order[a.severity] - order[b.severity]);
     Object.values(grouped).forEach(sortGroup);
     return grouped;
-  }, [structural, notation, rhetoric, critical, science]);
+  }, [structural, notation, rhetoric, critical]);
 
   const issueCounts = useMemo(() => {
     return {
@@ -255,7 +266,7 @@ export default function App() {
     setIsReviewing(true);
 
     try {
-      const res = await fetch("/api/review", {
+      const res = await fetch(`${getApiBase()}/api/review`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -516,10 +527,16 @@ export default function App() {
       });
       return;
     }
-    const original = doc.lines[item.line - 1] || "";
+    const anchorLine = resolveJumpLine(
+      latex,
+      item.line,
+      item.original || item.excerpt || item.reason || item.suggestion
+    );
+    const original = doc.lines[anchorLine - 1] || "";
     setActiveSuggestion({
       ...item,
-      original
+      original,
+      currentLine: anchorLine
     });
   };
 
@@ -559,7 +576,10 @@ export default function App() {
           return next;
         });
       }
-      setUndoStack((prev) => [...prev, { inverse, id: activeSuggestion.id }]);
+      setUndoStack((prev) => [
+        ...prev,
+        { inverse, id: activeSuggestion.id, agent: activeSuggestion.agent }
+      ]);
       clearActiveFix();
       setResolvedCounts((prev) => ({
         ...prev,
@@ -572,7 +592,7 @@ export default function App() {
     const patch = [
       {
         op: "replace",
-        path: `/lines/${activeSuggestion.line - 1}`,
+        path: `/lines/${(activeSuggestion.currentLine || activeSuggestion.line) - 1}`,
         value: activeSuggestion.suggestion
       }
     ];
@@ -597,7 +617,10 @@ export default function App() {
         return next;
       });
     }
-    setUndoStack((prev) => [...prev, { inverse, id: activeSuggestion.id }]);
+    setUndoStack((prev) => [
+      ...prev,
+      { inverse, id: activeSuggestion.id, agent: activeSuggestion.agent }
+    ]);
     clearActiveFix();
     setResolvedCounts((prev) => ({
       ...prev,
@@ -622,10 +645,8 @@ export default function App() {
     });
     setResolvedCounts((prev) => {
       const next = { ...prev };
-      const agents = Object.keys(next);
-      if (agents.length) {
-        const last = agents[agents.length - 1];
-        next[last] = Math.max(0, next[last] - 1);
+      if (entry.agent) {
+        next[entry.agent] = Math.max(0, (next[entry.agent] || 0) - 1);
       }
       return next;
     });
@@ -654,7 +675,7 @@ export default function App() {
   }, [acceptedPatches]);
 
   return (
-    <BrowserRouter>
+    <Router>
       <Routes>
         <Route
           path="/"
@@ -685,7 +706,6 @@ export default function App() {
           element={
             <ReviewPage
               latex={latex}
-              textAreaRef={textAreaRef}
               results={results}
               progress={progress}
               status={status}
@@ -696,10 +716,6 @@ export default function App() {
               prompts={prompts}
               macroText={macroText}
               suggestions={suggestions}
-              structural={structural}
-              notation={notation}
-              rhetoric={rhetoric}
-              critical={critical}
               science={science}
               summaryItems={summaryItems}
               activeSuggestion={activeSuggestion}
@@ -719,6 +735,6 @@ export default function App() {
           }
         />
       </Routes>
-    </BrowserRouter>
+    </Router>
   );
 }
